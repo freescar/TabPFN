@@ -1,7 +1,5 @@
 # TabPFN 技术汇报材料
 
-### —— 面向虚拟量测（Virtual Metrology）项目组
-
 ---
 
 ## 一、TabPFN 是什么？
