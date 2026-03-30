@@ -17,8 +17,8 @@ from tabpfn import TabPFNRegressor
 warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Degrees of freedom")
 warnings.filterwarnings("ignore", message="invalid value encountered in divide")
-# ★ 新增：屏蔽 matplotlib 缺字形警告（中文字符导致）
 warnings.filterwarnings("ignore", message=r"Glyph .* missing from font.*")
+
 
 # ============================================================
 # 配置区
@@ -58,6 +58,25 @@ PREDICT_BATCH_SIZE = 200
 
 # rolling chunk
 ROLLING_CHUNK_LOTS = 8
+
+# =========================
+# 稳定性 / 断点续跑配置
+# =========================
+ENABLE_RESUME = True
+RESUME_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "single_tool_results.csv")
+
+# mixed 稳定策略
+MIXED_MAX_ROWS = 120_000                 # mixed 总行数上限（超了就抽样）
+MIXED_MAX_LOTS_PER_TOOL = 450            # 每个 tool 最多保留多少 lots（None 表示不限制）
+MIXED_MAX_NUMERIC_FEATURES = 600         # mixed 模式下数值特征上限（更保守）
+
+# OOM 自动降配
+OOM_ESTIMATORS_SCHEDULE = [32, 24, 16, 12, 8]
+OOM_POLY_SCHEDULE = [20, 12, 8, 4, 0]
+
+# rolling 自适应 chunk
+ROLLING_CHUNK_LOTS_MIN = 1
+ROLLING_CHUNK_LOTS_MAX = 8
 
 
 # ============================================================
@@ -324,12 +343,89 @@ def create_model():
     )
 
 
+def create_model_with_params(n_estimators: int, poly_features: int):
+    return TabPFNRegressor(
+        model_path=MODEL_PATH,
+        device="cuda",
+        n_estimators=n_estimators,
+        softmax_temperature=FIXED_CONFIG["softmax_temperature"],
+        average_before_softmax=FIXED_CONFIG["average_before_softmax"],
+        memory_saving_mode=True,
+        ignore_pretraining_limits=True,
+        inference_config={
+            "SUBSAMPLE_SAMPLES": 10_000,
+            "POLYNOMIAL_FEATURES": poly_features,
+        },
+    )
+
+
+def is_oom_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("out of memory" in msg) or ("cuda oom" in msg) or ("cuda out of memory" in msg)
+
+
+def fit_predict_with_oom_retry(X_train, y_train, X_test, stage_name="stage"):
+    """
+    OOM 时自动降 n_estimators / poly_features 重试
+    """
+    last_err = None
+    trials = list(zip(OOM_ESTIMATORS_SCHEDULE, OOM_POLY_SCHEDULE))
+    for trial_i, (ne, poly) in enumerate(trials, 1):
+        try:
+            print(f"    [{stage_name}] trial {trial_i}/{len(trials)}: n_estimators={ne}, poly={poly}")
+            model = create_model_with_params(ne, poly)
+            model.fit(X_train, y_train)
+            pred = batched_predict(model, X_test)
+            del model
+            force_cleanup()
+            return pred, {"n_estimators": ne, "poly_features": poly}
+        except Exception as e:
+            last_err = e
+            force_cleanup()
+            if trial_i < len(trials):
+                continue
+            break
+    raise RuntimeError(f"{stage_name} failed after retry schedule. last_err={last_err}")
+
+
 def force_cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # 不 synchronize，避免频繁强制同步拖慢
-        # torch.cuda.synchronize()
+
+
+def load_completed_datasets(summary_csv_path):
+    if (not ENABLE_RESUME) or (not os.path.exists(summary_csv_path)):
+        return set()
+    try:
+        hist = pd.read_csv(summary_csv_path)
+        if "dataset" not in hist.columns:
+            return set()
+        return set(hist["dataset"].astype(str).tolist())
+    except Exception:
+        return set()
+
+
+def append_result_to_summary(summary_csv_path, result_dict):
+    row = {
+        "dataset": result_dict["dataset"],
+        "n_rows": result_dict["n_rows"],
+        "n_lots": result_dict["n_lots"],
+        "n_features": result_dict["n_features"],
+        "n_test": result_dict["n_test"],
+        "n_nonref": result_dict["n_nonref"],
+        "mae": result_dict["results"]["Rolling raw"]["mae"],
+        "r2": result_dict["results"]["Rolling raw"]["r2"],
+        "acc05": result_dict["results"]["Rolling raw"]["acc05"],
+        "acc10": result_dict["results"]["Rolling raw"]["acc10"],
+        "baseline_time": result_dict["baseline_time"],
+        "rolling_time": result_dict["rolling_time"],
+    }
+    df_row = pd.DataFrame([row])
+    if os.path.exists(summary_csv_path):
+        df_row.to_csv(summary_csv_path, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(summary_csv_path, mode="w", header=True, index=False)
 
 
 # ============================================================
@@ -402,7 +498,7 @@ def plot_time_series_raw_only(y_test, baseline_raw, rolling_raw, test_is_ref,
 # 核心 Pipeline（只跑 raw）
 # ============================================================
 
-def run_pipeline(df, dataset_name="dataset", output_dir=None):
+def run_pipeline(df, dataset_name="dataset", output_dir=None, *, is_mixed_mode=False):
     if output_dir is None:
         output_dir = OUTPUT_DIR
     print(f"\n{'─'*70}")
@@ -445,7 +541,8 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None):
         return None
 
     X_pure = X_with_meta[pure_feature_cols].copy()
-    X_pure = staged_feature_selection_keep_categorical(X_pure, max_numeric_features=MAX_FEATURES)
+    max_feats = MIXED_MAX_NUMERIC_FEATURES if is_mixed_mode else MAX_FEATURES
+    X_pure = staged_feature_selection_keep_categorical(X_pure, max_numeric_features=max_feats)
     X_pure = X_pure.replace([np.inf, -np.inf], np.nan)
     selected_feature_cols = X_pure.columns.tolist()
 
@@ -481,7 +578,7 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None):
     X_merged = pd.concat([X_pure, ref_features], axis=1)
     print(f"  特征: {X_merged.shape[1]} 列 (base {X_pure.shape[1]} + ref {ref_features.shape[1]})")
 
-    # ★ 仍然走纯数值输入（和你原 demo 一致）
+    # 仍然走纯数值输入
     X_all_np = X_merged.select_dtypes(include=[np.number]).values.astype(np.float32)
     X_all_np = np.nan_to_num(X_all_np, nan=np.nan, posinf=np.nan, neginf=np.nan)
     y_all_np = y_series.values.astype(np.float32)
@@ -493,39 +590,40 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None):
     print(f"  划分: train={train_end}, val={val_end-train_end}, test={n_test} ({len(test_lots_ordered)} lots)")
 
     # ==========================================
-    # Baseline raw
+    # Baseline raw（OOM 自动降配）
     # ==========================================
     print(f"  [Baseline raw]...", end=" ", flush=True)
     t0 = time.time()
     try:
-        baseline_model = create_model()
-        baseline_model.fit(X_all_np[:val_end], y_all_np[:val_end])
-        baseline_preds_raw = batched_predict(baseline_model, X_all_np[val_end:])
-        del baseline_model
-        force_cleanup()
+        baseline_preds_raw, baseline_cfg = fit_predict_with_oom_retry(
+            X_all_np[:val_end], y_all_np[:val_end], X_all_np[val_end:], stage_name="baseline"
+        )
         baseline_time = time.time() - t0
-        print(f"{baseline_time:.0f}s")
+        print(f"{baseline_time:.0f}s | cfg={baseline_cfg}")
     except Exception as e:
         print(f"❌ {e}")
         force_cleanup()
         return None
 
     # ==========================================
-    # Rolling raw (chunked)
+    # Rolling raw (adaptive chunk + OOM 自动降配)
     # ==========================================
-    print(f"  [Rolling raw chunked] {len(test_lots_ordered)} lots, chunk={ROLLING_CHUNK_LOTS}...")
+    print(f"  [Rolling raw adaptive] {len(test_lots_ordered)} lots...")
     rolling_preds_raw = np.full(n_total, np.nan)
     rolling_train_end = val_end
 
     total_lots = len(test_lots_ordered)
     rolling_start = time.time()
 
-    lot_chunks = [
-        test_lots_ordered[i:i + ROLLING_CHUNK_LOTS]
-        for i in range(0, total_lots, ROLLING_CHUNK_LOTS)
-    ]
+    rolling_chunk = min(max(ROLLING_CHUNK_LOTS, ROLLING_CHUNK_LOTS_MIN), ROLLING_CHUNK_LOTS_MAX)
+    lot_ptr = 0
+    chunk_i = 0
 
-    for chunk_i, lot_chunk in enumerate(lot_chunks, 1):
+    while lot_ptr < total_lots:
+        chunk_i += 1
+        end_ptr = min(lot_ptr + rolling_chunk, total_lots)
+        lot_chunk = test_lots_ordered[lot_ptr:end_ptr]
+
         chunk_test_indices = []
         for lot_id in lot_chunk:
             lot_indices = lot_to_indices[lot_id]
@@ -534,43 +632,55 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None):
                 chunk_test_indices.append(lot_test_indices)
 
         if not chunk_test_indices:
+            lot_ptr = end_ptr
             continue
 
         chunk_test_indices = np.unique(np.concatenate(chunk_test_indices))
         chunk_test_indices.sort()
 
         try:
-            model = create_model()
-            model.fit(X_all_np[:rolling_train_end], y_all_np[:rolling_train_end])
-
-            chunk_X = X_all_np[chunk_test_indices]
-            chunk_preds = batched_predict(model, chunk_X)
+            chunk_preds, used_cfg = fit_predict_with_oom_retry(
+                X_all_np[:rolling_train_end],
+                y_all_np[:rolling_train_end],
+                X_all_np[chunk_test_indices],
+                stage_name=f"rolling-chunk-{chunk_i}"
+            )
             rolling_preds_raw[chunk_test_indices] = chunk_preds
 
             lot_max_idx = int(chunk_test_indices.max()) + 1
             if lot_max_idx > rolling_train_end:
                 rolling_train_end = lot_max_idx
 
-            del model
-            force_cleanup()
+            if rolling_chunk < ROLLING_CHUNK_LOTS_MAX:
+                rolling_chunk += 1
+
+            lot_ptr = end_ptr
 
         except Exception as e:
-            print(f"    [chunk {chunk_i}/{len(lot_chunks)}] ❌ {e}")
+            print(f"    [chunk {chunk_i}] ❌ {e}")
             force_cleanup()
+
+            if rolling_chunk > ROLLING_CHUNK_LOTS_MIN:
+                rolling_chunk = max(ROLLING_CHUNK_LOTS_MIN, rolling_chunk // 2)
+                print(f"    [chunk {chunk_i}] ↘ 降低 rolling_chunk 到 {rolling_chunk} 后重试")
+                continue
+
+            # 最小 chunk 仍失败则 fallback baseline，避免卡死
             rolling_preds_raw[chunk_test_indices] = baseline_preds_raw[chunk_test_indices - val_end]
             lot_max_idx = int(chunk_test_indices.max()) + 1
             if lot_max_idx > rolling_train_end:
                 rolling_train_end = lot_max_idx
+            lot_ptr = end_ptr
 
         elapsed = time.time() - rolling_start
-        done_lots = min(chunk_i * ROLLING_CHUNK_LOTS, total_lots)
+        done_lots = lot_ptr
         avg = elapsed / max(done_lots, 1)
         eta = avg * (total_lots - done_lots)
-        print(f"    [chunk {chunk_i}/{len(lot_chunks)}] lots_done={done_lots}/{total_lots} ctx={rolling_train_end} "
-              f"| {elapsed:.0f}s elapsed, ETA {eta:.0f}s")
+        print(f"    [chunk {chunk_i}] lots_done={done_lots}/{total_lots} ctx={rolling_train_end} "
+              f"| chunk={rolling_chunk} | {elapsed:.0f}s elapsed, ETA {eta:.0f}s")
 
     rolling_time = time.time() - rolling_start
-    print(f"  Rolling raw chunked 完成: {rolling_time:.0f}s")
+    print(f"  Rolling raw adaptive 完成: {rolling_time:.0f}s")
 
     # ==========================================
     # 评估（只看 raw）
@@ -616,7 +726,6 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None):
                           f"{r['acc05']:>7.1f}% {r['acc10']:>7.1f}%")
     # ──────────────────────────────────────────────────────────────
 
-    # raw baseline = Rolling raw（你观察到普遍更好）
     best_name = "Rolling raw"
     best = results[best_name]
     print(f"\n  ✅ Baseline(更新): {best_name} | MAE={best['mae']:.4f} R²={best['r2']:.4f} "
@@ -660,6 +769,7 @@ def load_and_combine_all_tools(files):
     """
     加载所有文件并纵向拼接，使不同 tool 的 lot_id / wafer_id 保持唯一。
     若数据中没有 tool_name 列，则以文件名（不含扩展名）作为 tool 名。
+    额外加入：每个 tool 限 lots、总行数抽样。
     """
     dfs = []
     for filepath in files:
@@ -672,12 +782,22 @@ def load_and_combine_all_tools(files):
                 df[TOOL_NAME_COL] = tool_label
                 print(f"  ⚠️  {os.path.basename(filepath)}: 无 '{TOOL_NAME_COL}' 列，使用文件名 '{tool_label}'")
 
-            # 让 lot_id / wafer_id 在不同 tool 之间保持唯一（逐行前缀 tool 名，支持同文件含多 tool）
+            # 每个 tool 限 lots（可选）
+            if LOT_COL in df.columns and MIXED_MAX_LOTS_PER_TOOL is not None:
+                tmp = df.copy()
+                if TIME_COL in tmp.columns:
+                    tmp = tmp.sort_values(TIME_COL)
+                keep_lots = tmp[LOT_COL].astype(str).drop_duplicates().head(MIXED_MAX_LOTS_PER_TOOL).tolist()
+                df = df[df[LOT_COL].astype(str).isin(keep_lots)].copy()
+
+            # 让 lot_id / wafer_id 在不同 tool 之间保持唯一
             if LOT_COL in df.columns:
                 df[LOT_COL] = df[TOOL_NAME_COL].astype(str) + "_" + df[LOT_COL].astype(str)
             if WAFER_ID_COL in df.columns:
                 df[WAFER_ID_COL] = df[TOOL_NAME_COL].astype(str) + "_" + df[WAFER_ID_COL].astype(str)
+
             print(f"  加载 {os.path.basename(filepath)}: {len(df)} 行 | tool={df[TOOL_NAME_COL].unique().tolist()}")
+            dfs.append(df)  # 关键修复
 
         except Exception as e:
             print(f"  ❌ 加载失败 {os.path.basename(filepath)}: {e}")
@@ -686,6 +806,15 @@ def load_and_combine_all_tools(files):
         raise ValueError("没有成功加载任何数据文件")
 
     combined = pd.concat(dfs, ignore_index=True, sort=False)
+
+    # 总行数太大则抽样
+    if len(combined) > MIXED_MAX_ROWS:
+        if TIME_COL in combined.columns:
+            combined = combined.sample(MIXED_MAX_ROWS, random_state=42).sort_values(TIME_COL).reset_index(drop=True)
+        else:
+            combined = combined.sample(MIXED_MAX_ROWS, random_state=42).reset_index(drop=True)
+        print(f"  ⚠️ mixed 行数过大，已抽样到 {len(combined)} 行")
+
     print(f"\n  混合数据汇总: {len(combined)} 行, "
           f"涉及 {combined[TOOL_NAME_COL].nunique()} 个 tool: "
           f"{combined[TOOL_NAME_COL].unique().tolist()}")
@@ -713,7 +842,12 @@ def run_mixed_pipeline(files):
         print(f"  ⚠️ 混合数据量太少 ({len(combined_df)} 行)，跳过")
         return None
 
-    return run_pipeline(combined_df, dataset_name="[Mixed] ALL_TOOLS", output_dir=MIXED_OUTPUT_DIR)
+    return run_pipeline(
+        combined_df,
+        dataset_name="[Mixed] ALL_TOOLS",
+        output_dir=MIXED_OUTPUT_DIR,
+        is_mixed_mode=True,
+    )
 
 
 # ============================================================
@@ -738,6 +872,10 @@ if __name__ == "__main__":
     for f in files:
         print(f"  {os.path.basename(f)}")
 
+    completed = load_completed_datasets(RESUME_SUMMARY_PATH)
+    if completed:
+        print(f"\n断点续跑已启用：检测到 {len(completed)} 个已完成数据集（来自 {RESUME_SUMMARY_PATH}）")
+
     all_results = []
     total_start = time.time()
 
@@ -746,6 +884,10 @@ if __name__ == "__main__":
         print(f"\n{'='*70}")
         print(f"  [{file_i+1}/{len(files)}] {fname}")
         print(f"{'='*70}")
+
+        if ENABLE_RESUME and fname in completed:
+            print("  ⏭️ 已在结果文件中，跳过")
+            continue
 
         try:
             df = load_single_file(filepath)
@@ -760,12 +902,13 @@ if __name__ == "__main__":
                 print(f"  ⚠️ 跳过: 数据量太少 ({len(df)} 行)")
                 continue
 
-            result = run_pipeline(df, dataset_name=fname)
+            result = run_pipeline(df, dataset_name=fname, is_mixed_mode=False)
             if result is not None:
-                # 记录该文件中实际的 tool_name 值，供混合推理对比使用
                 if TOOL_NAME_COL in df.columns:
                     result["tool_names"] = df[TOOL_NAME_COL].unique().tolist()
                 all_results.append(result)
+                append_result_to_summary(RESUME_SUMMARY_PATH, result)
+                completed.add(fname)
 
             del df
             force_cleanup()
@@ -802,7 +945,7 @@ if __name__ == "__main__":
         print(f"  📋 最终对比汇总（单 tool 独立推理 vs 混合推理）")
         print(f"{'#'*70}")
 
-        metric_col = "Rolling raw"  # 以 Rolling raw 作为主要比较基准
+        metric_col = "Rolling raw"
 
         print(f"\n  【单 tool 独立推理】")
         print(f"  {'数据集':<30} {'MAE':>8} {'R²':>8} {'Acc@0.5':>8} {'Acc@1.0':>8}")
@@ -824,7 +967,6 @@ if __name__ == "__main__":
                   f"{m.get('acc05', float('nan')):>7.1f}% "
                   f"{m.get('acc10', float('nan')):>7.1f}%")
 
-            # 若混合结果含 per_tool_results，再细化对比
             per_tool = mixed_result.get("per_tool_results", {})
             if per_tool:
                 print(f"\n  【混合推理 - 按 tool 拆分 vs 单 tool 独立推理对比】({metric_col})")
