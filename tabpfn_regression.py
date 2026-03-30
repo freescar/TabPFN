@@ -42,6 +42,12 @@ WAFER_ID_COL = "wafer_id"
 OUTPUT_DIR = "./result/tool_all_fdc_1011_1229"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# 混合推理配置
+TOOL_NAME_COL = "tool_name"          # 数据中区分 tool 的列名
+RUN_MIXED_MODE = True                # True: 额外运行所有 tool 混合推理
+MIXED_OUTPUT_DIR = "./result/tool_mixed_inference"
+os.makedirs(MIXED_OUTPUT_DIR, exist_ok=True)
+
 FIXED_CONFIG = {
     "n_estimators": 32,
     "softmax_temperature": 0.5,
@@ -396,7 +402,9 @@ def plot_time_series_raw_only(y_test, baseline_raw, rolling_raw, test_is_ref,
 # 核心 Pipeline（只跑 raw）
 # ============================================================
 
-def run_pipeline(df, dataset_name="dataset"):
+def run_pipeline(df, dataset_name="dataset", output_dir=None):
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
     print(f"\n{'─'*70}")
     print(f"  📂 {dataset_name}")
     print(f"{'─'*70}")
@@ -585,6 +593,29 @@ def run_pipeline(df, dataset_name="dataset"):
         print(f"     {name:<16} {r['mae']:>8.4f} {r['r2']:>8.4f} "
               f"{r['acc05']:>7.1f}% {r['acc10']:>7.1f}%")
 
+    # ── 混合模式：按 tool_name 拆分测试集指标 ──────────────────────
+    per_tool_results = {}
+    if TOOL_NAME_COL in df.columns:
+        tool_labels_test = df[TOOL_NAME_COL].iloc[val_end:].values
+        unique_tools = pd.Series(tool_labels_test).unique()
+        if len(unique_tools) > 1:
+            print(f"\n  📊 按 tool 拆分 (Non-ref) [RAW only]:")
+            print(f"     {'tool':<20} {'方案':<16} {'MAE':>8} {'R²':>8} {'Acc@0.5':>8} {'Acc@1.0':>8}")
+            print(f"     {'─'*76}")
+            for tool in sorted(unique_tools):
+                tool_mask = (tool_labels_test == tool) & test_is_nonref
+                if tool_mask.sum() < 2:
+                    continue
+                t_results = {
+                    "Baseline raw": compute_all_metrics(y_test[tool_mask], baseline_preds_raw[tool_mask]),
+                    "Rolling raw":  compute_all_metrics(y_test[tool_mask], roll_raw[tool_mask]),
+                }
+                per_tool_results[tool] = t_results
+                for name, r in t_results.items():
+                    print(f"     {str(tool):<20} {name:<16} {r['mae']:>8.4f} {r['r2']:>8.4f} "
+                          f"{r['acc05']:>7.1f}% {r['acc10']:>7.1f}%")
+    # ──────────────────────────────────────────────────────────────
+
     # raw baseline = Rolling raw（你观察到普遍更好）
     best_name = "Rolling raw"
     best = results[best_name]
@@ -598,7 +629,7 @@ def run_pipeline(df, dataset_name="dataset"):
         test_is_ref=test_is_ref,
         results=results,
         dataset_name=dataset_name,
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
     )
     print(f"  📈 {plot_path}")
 
@@ -614,10 +645,75 @@ def run_pipeline(df, dataset_name="dataset"):
         "n_test": int(n_total - val_end),
         "n_nonref": int(n_nonref),
         "results": results,
+        "per_tool_results": per_tool_results,
         "baseline_name": best_name,
         "baseline_time": float(baseline_time),
         "rolling_time": float(rolling_time),
     }
+
+
+# ============================================================
+# 混合推理：加载并合并所有 tool 数据
+# ============================================================
+
+def load_and_combine_all_tools(files):
+    """
+    加载所有文件并纵向拼接，使不同 tool 的 lot_id / wafer_id 保持唯一。
+    若数据中没有 tool_name 列，则以文件名（不含扩展名）作为 tool 名。
+    """
+    dfs = []
+    for filepath in files:
+        try:
+            df = load_single_file(filepath)
+
+            # 确保有 tool_name 列
+            if TOOL_NAME_COL not in df.columns:
+                tool_label = os.path.splitext(os.path.basename(filepath))[0]
+                df[TOOL_NAME_COL] = tool_label
+                print(f"  ⚠️  {os.path.basename(filepath)}: 无 '{TOOL_NAME_COL}' 列，使用文件名 '{tool_label}'")
+
+            # 让 lot_id / wafer_id 在不同 tool 之间保持唯一（逐行前缀 tool 名，支持同文件含多 tool）
+            if LOT_COL in df.columns:
+                df[LOT_COL] = df[TOOL_NAME_COL].astype(str) + "_" + df[LOT_COL].astype(str)
+            if WAFER_ID_COL in df.columns:
+                df[WAFER_ID_COL] = df[TOOL_NAME_COL].astype(str) + "_" + df[WAFER_ID_COL].astype(str)
+            print(f"  加载 {os.path.basename(filepath)}: {len(df)} 行 | tool={df[TOOL_NAME_COL].unique().tolist()}")
+
+        except Exception as e:
+            print(f"  ❌ 加载失败 {os.path.basename(filepath)}: {e}")
+
+    if not dfs:
+        raise ValueError("没有成功加载任何数据文件")
+
+    combined = pd.concat(dfs, ignore_index=True, sort=False)
+    print(f"\n  混合数据汇总: {len(combined)} 行, "
+          f"涉及 {combined[TOOL_NAME_COL].nunique()} 个 tool: "
+          f"{combined[TOOL_NAME_COL].unique().tolist()}")
+    return combined
+
+
+def run_mixed_pipeline(files):
+    """
+    将所有 tool 数据混合后跑一次完整 pipeline。
+    tool_name 列会作为普通（类别）特征参与训练。
+    run_pipeline 内部会自动按 tool_name 拆分测试集指标。
+    """
+    print(f"\n{'#'*70}")
+    print(f"  🔀 混合推理 (Mixed Inference): 所有 tool 合并训练 & 推理")
+    print(f"{'#'*70}")
+
+    combined_df = load_and_combine_all_tools(files)
+
+    missing = [c for c in [TARGET_COL, SLOT_COL, TIME_COL] if c not in combined_df.columns]
+    if missing:
+        print(f"  ⚠️ 混合数据缺少列 {missing}，跳过混合推理")
+        return None
+
+    if len(combined_df) < 50:
+        print(f"  ⚠️ 混合数据量太少 ({len(combined_df)} 行)，跳过")
+        return None
+
+    return run_pipeline(combined_df, dataset_name="[Mixed] ALL_TOOLS", output_dir=MIXED_OUTPUT_DIR)
 
 
 # ============================================================
@@ -666,6 +762,9 @@ if __name__ == "__main__":
 
             result = run_pipeline(df, dataset_name=fname)
             if result is not None:
+                # 记录该文件中实际的 tool_name 值，供混合推理对比使用
+                if TOOL_NAME_COL in df.columns:
+                    result["tool_names"] = df[TOOL_NAME_COL].unique().tolist()
                 all_results.append(result)
 
             del df
@@ -678,4 +777,71 @@ if __name__ == "__main__":
             force_cleanup()
 
     total_time = time.time() - total_start
-    print(f"\n✅ 全部完成，总耗时: {total_time:.0f}s ({total_time/60:.1f} min)")
+    print(f"\n✅ 单 tool 推理全部完成，总耗时: {total_time:.0f}s ({total_time/60:.1f} min)")
+
+    # ============================================================
+    # 混合推理（可选）
+    # ============================================================
+    mixed_result = None
+    if RUN_MIXED_MODE and len(files) > 1:
+        try:
+            mixed_result = run_mixed_pipeline(files)
+        except Exception as e:
+            print(f"\n  ❌ 混合推理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            force_cleanup()
+    elif RUN_MIXED_MODE and len(files) == 1:
+        print(f"\n⚠️  仅发现 1 个数据文件，无需混合推理（与单 tool 推理相同）")
+
+    # ============================================================
+    # 最终对比汇总
+    # ============================================================
+    if all_results or mixed_result:
+        print(f"\n{'#'*70}")
+        print(f"  📋 最终对比汇总（单 tool 独立推理 vs 混合推理）")
+        print(f"{'#'*70}")
+
+        metric_col = "Rolling raw"  # 以 Rolling raw 作为主要比较基准
+
+        print(f"\n  【单 tool 独立推理】")
+        print(f"  {'数据集':<30} {'MAE':>8} {'R²':>8} {'Acc@0.5':>8} {'Acc@1.0':>8}")
+        print(f"  {'─'*60}")
+        for r in all_results:
+            m = r["results"].get(metric_col, {})
+            print(f"  {r['dataset']:<30} {m.get('mae', float('nan')):>8.4f} "
+                  f"{m.get('r2', float('nan')):>8.4f} "
+                  f"{m.get('acc05', float('nan')):>7.1f}% "
+                  f"{m.get('acc10', float('nan')):>7.1f}%")
+
+        if mixed_result:
+            print(f"\n  【混合推理（所有 tool 合并）】")
+            print(f"  {'数据集':<30} {'MAE':>8} {'R²':>8} {'Acc@0.5':>8} {'Acc@1.0':>8}")
+            print(f"  {'─'*60}")
+            m = mixed_result["results"].get(metric_col, {})
+            print(f"  {'[Mixed] ALL_TOOLS':<30} {m.get('mae', float('nan')):>8.4f} "
+                  f"{m.get('r2', float('nan')):>8.4f} "
+                  f"{m.get('acc05', float('nan')):>7.1f}% "
+                  f"{m.get('acc10', float('nan')):>7.1f}%")
+
+            # 若混合结果含 per_tool_results，再细化对比
+            per_tool = mixed_result.get("per_tool_results", {})
+            if per_tool:
+                print(f"\n  【混合推理 - 按 tool 拆分 vs 单 tool 独立推理对比】({metric_col})")
+                print(f"  {'tool':<25} {'混合-MAE':>10} {'单独-MAE':>10} {'混合-R²':>8} {'单独-R²':>8}")
+                print(f"  {'─'*65}")
+                single_by_tool = {}
+                for r in all_results:
+                    for tn in r.get("tool_names", []):
+                        single_by_tool[tn] = r["results"].get(metric_col, {})
+                for tool, t_res in sorted(per_tool.items()):
+                    m_mix = t_res.get(metric_col, {})
+                    m_single = single_by_tool.get(tool, {})
+                    print(f"  {str(tool):<25} "
+                          f"{m_mix.get('mae', float('nan')):>10.4f} "
+                          f"{m_single.get('mae', float('nan')):>10.4f} "
+                          f"{m_mix.get('r2', float('nan')):>8.4f} "
+                          f"{m_single.get('r2', float('nan')):>8.4f}")
+
+    grand_total = time.time() - total_start
+    print(f"\n✅ 全部完成（含混合推理），总耗时: {grand_total:.0f}s ({grand_total/60:.1f} min)")
