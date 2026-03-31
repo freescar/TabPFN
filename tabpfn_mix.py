@@ -71,7 +71,7 @@ SKIP_SINGLE_TOOL_TRAINING = True  # Set to True to only run mixed inference
 # Mixed inference lightweight config
 MIXED_MODEL_CONFIG = {
     "n_estimators": 8,
-    "polynomial_features": 0,
+    "polynomial_features": 1,
 }
 
 # mixed 稳定策略
@@ -81,7 +81,7 @@ MIXED_MAX_NUMERIC_FEATURES = 600         # mixed 模式下数值特征上限（�
 
 # OOM 自动降配
 OOM_ESTIMATORS_SCHEDULE = [32, 24, 16, 12, 8]
-OOM_POLY_SCHEDULE = [20, 12, 8, 4, 0]
+OOM_POLY_SCHEDULE = [20, 12, 8, 4, 1]
 
 # rolling 自适应 chunk
 ROLLING_CHUNK_LOTS_MIN = 1
@@ -384,7 +384,7 @@ def fit_predict_with_oom_retry(X_train, y_train, X_test, stage_name="stage", mix
         poly0 = MIXED_MODEL_CONFIG["polynomial_features"]
         # Build a descending schedule starting from the mixed config values
         ne_sched = [ne for ne in OOM_ESTIMATORS_SCHEDULE if ne <= ne0] or [ne0]
-        poly_sched = [0] * len(ne_sched)
+        poly_sched = [poly0] * len(ne_sched)
         trials = list(zip(ne_sched, poly_sched))
     else:
         trials = list(zip(OOM_ESTIMATORS_SCHEDULE, OOM_POLY_SCHEDULE))
@@ -626,19 +626,42 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None, *, is_mixed_mode=F
     # ==========================================
     # Baseline raw（OOM 自动降配）
     # ==========================================
-    print(f"  [Baseline raw]...", end=" ", flush=True)
-    t0 = time.time()
-    try:
-        baseline_preds_raw, baseline_cfg = fit_predict_with_oom_retry(
-            X_all_np[:val_end], y_all_np[:val_end], X_all_np[val_end:],
-            stage_name="baseline", mixed_mode=is_mixed_mode,
-        )
-        baseline_time = time.time() - t0
-        print(f"{baseline_time:.0f}s | cfg={baseline_cfg}")
-    except Exception as e:
-        print(f"❌ {e}")
-        force_cleanup()
-        return None
+    if is_mixed_mode:
+        # Mixed mode: use lightweight fixed config (no OOM schedule)
+        print(f"  [Baseline raw - Mixed Mode]...", end=" ", flush=True)
+        t0 = time.time()
+        try:
+            model = create_model_with_params(
+                MIXED_MODEL_CONFIG["n_estimators"], MIXED_MODEL_CONFIG["polynomial_features"]
+            )
+            model.fit(X_all_np[:val_end], y_all_np[:val_end])
+            baseline_preds_raw = batched_predict(model, X_all_np[val_end:])
+            baseline_cfg = {
+                "n_estimators": MIXED_MODEL_CONFIG["n_estimators"],
+                "poly_features": MIXED_MODEL_CONFIG["polynomial_features"],
+            }
+            baseline_time = time.time() - t0
+            del model
+            force_cleanup()
+            print(f"{baseline_time:.0f}s | cfg={baseline_cfg}")
+        except Exception as e:
+            print(f"❌ Mixed mode baseline failed: {e}")
+            force_cleanup()
+            return None
+    else:
+        print(f"  [Baseline raw]...", end=" ", flush=True)
+        t0 = time.time()
+        try:
+            baseline_preds_raw, baseline_cfg = fit_predict_with_oom_retry(
+                X_all_np[:val_end], y_all_np[:val_end], X_all_np[val_end:],
+                stage_name="baseline",
+            )
+            baseline_time = time.time() - t0
+            print(f"{baseline_time:.0f}s | cfg={baseline_cfg}")
+        except Exception as e:
+            print(f"❌ {e}")
+            force_cleanup()
+            return None
 
     # ==========================================
     # Rolling raw (adaptive chunk + OOM 自动降配)
