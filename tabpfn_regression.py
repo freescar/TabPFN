@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", message=r"Glyph .* missing from font.*")
 # 配置区
 # ============================================================
 
-data_path = 'datasets/'
+data_path = '/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229'
 
 TARGET_COL = 'met'
 TIME_COL = "start_time"
@@ -32,20 +32,20 @@ train_end_ratio = 0.7
 val_end_ratio = 0.8
 
 MAX_FEATURES = 1000
-MODEL_PATH = './models/tabpfn-v2.5-regressor-v2.5_default.ckpt'
+MODEL_PATH = '/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v2.5-regressor-v2.5_default.ckpt'
 
 REFERENCE_SLOT_IDS = [2, 3, 4, 5, 12, 13, 20, 21, 22, 23]
 SLOT_COL = "slot_id"
 LOT_COL = "lot_id"
 WAFER_ID_COL = "wafer_id"
 
-OUTPUT_DIR = "./result/tool_all_fdc_1011_1229"
+OUTPUT_DIR = "/ossfs/workspace/xrfm/TabPFN-main/result/tool_all_fdc_1011_1229_mix"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 混合推理配置
 TOOL_NAME_COL = "tool_name"          # 数据中区分 tool 的列名
 RUN_MIXED_MODE = True                # True: 额外运行所有 tool 混合推理
-MIXED_OUTPUT_DIR = "./result/tool_mixed_inference"
+MIXED_OUTPUT_DIR = "/ossfs/workspace/xrfm/TabPFN-main/result/tool_all_fdc_1011_1229_mix"
 os.makedirs(MIXED_OUTPUT_DIR, exist_ok=True)
 
 FIXED_CONFIG = {
@@ -577,6 +577,13 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None, *, is_mixed_mode=F
 
     X_merged = pd.concat([X_pure, ref_features], axis=1)
     print(f"  特征: {X_merged.shape[1]} 列 (base {X_pure.shape[1]} + ref {ref_features.shape[1]})")
+
+    # 在 select_dtypes 之前，对类别列做 Label Encoding
+    from sklearn.preprocessing import OrdinalEncoder
+    cat_cols_in_merged = X_merged.select_dtypes(exclude=[np.number]).columns.tolist()
+    if cat_cols_in_merged:
+        enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+        X_merged[cat_cols_in_merged] = enc.fit_transform(X_merged[cat_cols_in_merged])
 
     # 仍然走纯数值输入
     X_all_np = X_merged.select_dtypes(include=[np.number]).values.astype(np.float32)
