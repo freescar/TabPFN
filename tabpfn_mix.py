@@ -68,16 +68,23 @@ RESUME_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "single_tool_results.csv")
 # Skip single-tool training if results exist
 SKIP_SINGLE_TOOL_TRAINING = True  # Set to True to only run mixed inference
 
-# Mixed inference lightweight config
+# 混合训练策略（v2）：
+# 1. 按 lot 级别采样（保留 lot 内结构，确保 ref wafer 特征有效）
+# 2. 每个 tool 贡献平衡（分层采样）
+# 3. 更强的模型配置（n_estimators=16, poly=8）
+# 4. tool_name 保留为类别特征（让 TabPFN 学习 tool-specific patterns）
+
+# Mixed inference config (stronger for multi-tool complexity)
 MIXED_MODEL_CONFIG = {
-    "n_estimators": 8,
-    "polynomial_features": 1,
+    "n_estimators": 16,       # ↑ from 8 (more ensemble for multi-tool noise)
+    "polynomial_features": 8,  # ↑ from 1 (capture cross-tool interactions)
 }
 
-# mixed 稳定策略
-MIXED_MAX_ROWS = 60_000                  # mixed 总行数上限（超了就抽样）
-MIXED_MAX_LOTS_PER_TOOL = 450            # 每个 tool 最多保留多少 lots（None 表示不限制）
+# Sampling strategy
+MIXED_MAX_ROWS = 80_000                  # ↑ from 60_000 (more data for multi-tool)
+MIXED_MAX_LOTS_PER_TOOL = 300            # ↓ from 450 (but keep FULL lots)
 MIXED_MAX_NUMERIC_FEATURES = 600         # mixed 模式下数值特征上限（更保守）
+MIXED_KEEP_TOOL_AS_CATEGORICAL = True    # Keep tool_name as categorical for TabPFN embeddings
 
 # OOM 自动降配
 OOM_ESTIMATORS_SCHEDULE = [32, 24, 16, 12, 8]
@@ -307,6 +314,80 @@ def staged_feature_selection_keep_categorical(
 
     X_out = pd.concat([X_num, X_cat], axis=1)
     print(f"    ✅ 输出列: {X_out.shape[1]} (num={X_num.shape[1]} + cat={X_cat.shape[1]})")
+    return X_out
+
+
+def staged_feature_selection_mixed_mode(X: pd.DataFrame, max_numeric_features: int = 600) -> pd.DataFrame:
+    """
+    混合模式的特征筛选：
+    - 保留 tool_name 作为类别特征（让 TabPFN 学习 tool embeddings）
+    - 删除跨 tool 方差为 0 的特征（无区分度）
+    - 优先保留高方差、低 NaN 的特征
+    """
+    print(f"\n  [Mixed] 特征筛选 总列={X.shape[1]} | 目标数值列 ≤ {max_numeric_features}")
+
+    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in X.columns if c not in numeric_cols]
+
+    X_num = X[numeric_cols].copy() if numeric_cols else pd.DataFrame(index=X.index)
+    X_cat = X[cat_cols].copy() if cat_cols else pd.DataFrame(index=X.index)
+
+    if not X_num.empty:
+        # Remove all-NaN columns
+        all_nan_cols = X_num.columns[X_num.isna().all()].tolist()
+        if all_nan_cols:
+            X_num = X_num.drop(columns=all_nan_cols)
+
+        # Remove constant columns
+        nunique = X_num.nunique(dropna=True)
+        const_cols = nunique[nunique <= 1].index.tolist()
+        if const_cols:
+            X_num = X_num.drop(columns=const_cols)
+            print(f"    [num] 删除 {len(const_cols)} 常数列 → {X_num.shape[1]}")
+
+        # Remove mostly-NaN (>95% for mixed mode, stricter than single-tool)
+        nan_ratio = X_num.isna().mean()
+        mostly_nan_cols = nan_ratio[nan_ratio > 0.95].index.tolist()
+        if mostly_nan_cols:
+            X_num = X_num.drop(columns=mostly_nan_cols)
+            print(f"    [num] 删除 {len(mostly_nan_cols)} NaN>95%列 → {X_num.shape[1]}")
+
+        # If still too many, prioritize features with high variance and low NaN
+        if X_num.shape[1] > max_numeric_features:
+            feature_scores = {}
+            for col in X_num.columns:
+                nan_count = X_num[col].isna().sum()
+                variance = X_num[col].var()
+                score = variance / (1 + nan_count / len(X_num))
+                feature_scores[col] = score if not np.isnan(score) else -1e10
+
+            sorted_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)
+            keep_cols = [col for col, _ in sorted_features[:max_numeric_features]]
+            X_num = X_num[keep_cols]
+            print(f"    [num] 按方差/NaN评分保留 top {max_numeric_features} 列 → {X_num.shape[1]}")
+    else:
+        print("    [num] 数值列=0（跳过数值筛选）")
+
+    if not X_cat.empty:
+        # Always keep tool_name; filter other categoricals
+        priority_cats = [c for c in X_cat.columns if c == TOOL_NAME_COL]
+        other_cats = [c for c in X_cat.columns if c != TOOL_NAME_COL]
+
+        filtered_cats = []
+        for col in other_cats:
+            col_nunique = X_cat[col].nunique(dropna=True)
+            col_nan_ratio = X_cat[col].isna().mean()
+            # Keep if: 2 ≤ unique ≤ 50 and NaN < 50%
+            if 2 <= col_nunique <= 50 and col_nan_ratio < 0.5:
+                filtered_cats.append(col)
+
+        X_cat = X_cat[priority_cats + filtered_cats]
+        print(f"    [cat] 保留 {len(X_cat.columns)} 列 (含 tool_name={TOOL_NAME_COL in X_cat.columns})")
+    else:
+        print("    [cat] 类别列=0")
+
+    X_out = pd.concat([X_num, X_cat], axis=1)
+    print(f"    ✅ 输出: {X_out.shape[1]} 列 (num={X_num.shape[1]} + cat={X_cat.shape[1]})")
     return X_out
 
 
@@ -568,8 +649,10 @@ def run_pipeline(df, dataset_name="dataset", output_dir=None, *, is_mixed_mode=F
         return None
 
     X_pure = X_with_meta[pure_feature_cols].copy()
-    max_feats = MIXED_MAX_NUMERIC_FEATURES if is_mixed_mode else MAX_FEATURES
-    X_pure = staged_feature_selection_keep_categorical(X_pure, max_numeric_features=max_feats)
+    if is_mixed_mode:
+        X_pure = staged_feature_selection_mixed_mode(X_pure, max_numeric_features=MIXED_MAX_NUMERIC_FEATURES)
+    else:
+        X_pure = staged_feature_selection_keep_categorical(X_pure, max_numeric_features=MAX_FEATURES)
     X_pure = X_pure.replace([np.inf, -np.inf], np.nan)
     selected_feature_cols = X_pure.columns.tolist()
 
@@ -891,6 +974,97 @@ def load_and_combine_all_tools(files):
     return combined
 
 
+def load_and_combine_all_tools_v2(files):
+    """
+    改进的混合数据加载（v2）：
+    - 按 tool 分层采样
+    - 保留完整的 lot 结构（不做行级采样）
+    - 确保每个 tool 贡献平衡
+    - 保留最新的 lots（时序相关性更强）
+    """
+    all_tool_data = []
+    lot_col = LOT_COL  # Use global lot column name
+
+    for filepath in files:
+        try:
+            df = load_single_file(filepath)
+
+            # 确保有 tool_name 列
+            if TOOL_NAME_COL not in df.columns:
+                tool_label = os.path.splitext(os.path.basename(filepath))[0]
+                df[TOOL_NAME_COL] = tool_label
+
+            # 按时间排序
+            if TIME_COL in df.columns:
+                df = df.sort_values(TIME_COL)
+
+            # ✅ 按 LOT 级别采样（不做行级采样）
+            actual_lot_col = lot_col if lot_col in df.columns else (
+                resolve_lot_column(df) if WAFER_ID_COL in df.columns else None
+            )
+            if actual_lot_col is None:
+                print(f"  ⚠️ {os.path.basename(filepath)}: 无法确定 lot 列，跳过")
+                continue
+
+            unique_lots = df[actual_lot_col].unique()
+
+            if MIXED_MAX_LOTS_PER_TOOL is not None and len(unique_lots) > MIXED_MAX_LOTS_PER_TOOL:
+                # 保留最近的 lots（时序相关性）
+                sampled_lots = unique_lots[-MIXED_MAX_LOTS_PER_TOOL:]
+            else:
+                sampled_lots = unique_lots
+
+            tool_sampled = df[df[actual_lot_col].isin(sampled_lots)].copy()
+
+            # 让 lot_id / wafer_id 在不同 tool 之间保持唯一
+            tool_sampled[actual_lot_col] = (
+                tool_sampled[TOOL_NAME_COL].astype(str) + "_" + tool_sampled[actual_lot_col].astype(str)
+            )
+            if WAFER_ID_COL in tool_sampled.columns and actual_lot_col != WAFER_ID_COL:
+                tool_sampled[WAFER_ID_COL] = (
+                    tool_sampled[TOOL_NAME_COL].astype(str) + "_" + tool_sampled[WAFER_ID_COL].astype(str)
+                )
+
+            all_tool_data.append(tool_sampled)
+            print(f"  加载 {os.path.basename(filepath)}: {len(tool_sampled)} 行, {len(sampled_lots)} lots")
+
+        except Exception as e:
+            print(f"  ❌ 加载失败 {os.path.basename(filepath)}: {e}")
+
+    if not all_tool_data:
+        raise ValueError("没有成功加载任何数据文件")
+
+    combined = pd.concat(all_tool_data, ignore_index=True, sort=False)
+
+    # ✅ 仅当总行数超限时才做分层抽样（按 tool 分层，保留 lot 结构）
+    if len(combined) > MIXED_MAX_ROWS:
+        print(f"  ⚠️ 总行数 {len(combined)} > {MIXED_MAX_ROWS}，按 tool 分层抽样（保留 lot 结构）...")
+        sampled_dfs = []
+        tools = combined[TOOL_NAME_COL].unique()
+        rows_per_tool = MIXED_MAX_ROWS // len(tools)
+
+        for tool in tools:
+            tool_df = combined[combined[TOOL_NAME_COL] == tool].copy()
+            if len(tool_df) > rows_per_tool:
+                # 按 lot 缩减（而非行级采样），保留最近的 lots
+                tool_lots = tool_df[lot_col].unique() if lot_col in tool_df.columns else None
+                if tool_lots is not None and len(tool_lots) > 1:
+                    n_keep_lots = max(1, int(len(tool_lots) * rows_per_tool / len(tool_df)))
+                    keep_lots = tool_lots[-n_keep_lots:]
+                    tool_df = tool_df[tool_df[lot_col].isin(keep_lots)]
+            sampled_dfs.append(tool_df)
+
+        combined = pd.concat(sampled_dfs, ignore_index=True)
+        if TIME_COL in combined.columns:
+            combined = combined.sort_values(TIME_COL).reset_index(drop=True)
+
+    actual_lot_col_in_combined = lot_col if lot_col in combined.columns else WAFER_ID_COL
+    print(f"\n  ✅ 混合数据（保留 lot 结构）: {len(combined)} 行, "
+          f"{combined[actual_lot_col_in_combined].nunique()} lots, "
+          f"{combined[TOOL_NAME_COL].nunique()} tools")
+    return combined
+
+
 def run_mixed_pipeline(files):
     """
     将所有 tool 数据混合后跑一次完整 pipeline。
@@ -901,7 +1075,7 @@ def run_mixed_pipeline(files):
     print(f"  🔀 混合推理 (Mixed Inference): 所有 tool 合并训练 & 推理")
     print(f"{'#'*70}")
 
-    combined_df = load_and_combine_all_tools(files)
+    combined_df = load_and_combine_all_tools_v2(files)
 
     missing = [c for c in [TARGET_COL, SLOT_COL, TIME_COL] if c not in combined_df.columns]
     if missing:
@@ -1096,6 +1270,58 @@ if __name__ == "__main__":
                           f"{m_single.get('mae', float('nan')):>10.4f} "
                           f"{m_mix.get('r2', float('nan')):>8.4f} "
                           f"{m_single.get('r2', float('nan')):>8.4f}")
+
+            # ============================================================
+            # 诊断分析：哪些 tool 改善了，哪些退化了
+            # ============================================================
+            if per_tool and single_by_tool:
+                print(f"\n{'#'*70}")
+                print(f"  📊 混合训练诊断分析")
+                print(f"{'#'*70}")
+
+                improvements = []
+                degradations = []
+                unchanged = []
+
+                for tool, t_res in per_tool.items():
+                    if tool not in single_by_tool:
+                        continue
+                    m_mix = t_res.get(mixed_metric_col, {})
+                    m_single = single_by_tool[tool]
+                    mixed_mae = m_mix.get("mae", float("nan"))
+                    single_mae = m_single.get("mae", float("nan"))
+                    if np.isnan(mixed_mae) or np.isnan(single_mae) or single_mae == 0:
+                        continue
+                    mae_change = (mixed_mae - single_mae) / single_mae * 100
+                    entry = (tool, mae_change, mixed_mae, single_mae)
+                    if mae_change < -2:
+                        improvements.append(entry)
+                    elif mae_change > 2:
+                        degradations.append(entry)
+                    else:
+                        unchanged.append(entry)
+
+                print(f"\n  ✅ 改善的 tools ({len(improvements)}):")
+                if improvements:
+                    print(f"     {'Tool':<25} {'变化%':>8} {'混合MAE':>10} {'单独MAE':>10}")
+                    print(f"     {'─'*57}")
+                    for tool, change, mixed_mae, single_mae in sorted(improvements, key=lambda x: x[1])[:10]:
+                        print(f"     {str(tool):<25} {change:>7.1f}% {mixed_mae:>10.4f} {single_mae:>10.4f}")
+
+                print(f"\n  ➡️  基本持平的 tools ({len(unchanged)}) (MAE 变化在 ±2% 内)")
+
+                print(f"\n  ⚠️  退化的 tools ({len(degradations)}):")
+                if degradations:
+                    print(f"     {'Tool':<25} {'变化%':>8} {'混合MAE':>10} {'单独MAE':>10}")
+                    print(f"     {'─'*57}")
+                    for tool, change, mixed_mae, single_mae in sorted(degradations, key=lambda x: x[1], reverse=True)[:10]:
+                        print(f"     {str(tool):<25} {change:>7.1f}% {mixed_mae:>10.4f} {single_mae:>10.4f}")
+
+                all_entries = improvements + degradations + unchanged
+                if all_entries:
+                    avg_change = np.mean([x[1] for x in all_entries])
+                    print(f"\n  📈 平均 MAE 变化: {avg_change:+.1f}%  "
+                          f"(改善={len(improvements)}, 持平={len(unchanged)}, 退化={len(degradations)})")
 
     grand_total = time.time() - total_start
     print(f"\n✅ 全部完成（含混合推理），总耗时: {grand_total:.0f}s ({grand_total/60:.1f} min)")
