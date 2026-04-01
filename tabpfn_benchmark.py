@@ -23,6 +23,7 @@ ROW_SIZES    = [500, 1000, 5000, 10000, 50000]   # 样本数
 COL_SIZES    = [100, 500, 1000, 2000]             # 特征数
 N_ESTIMATORS = 4                                  # 减小以加速基准测试（可调）
 PREDICT_ROWS = 200                                # 每次预测的样本数
+MODEL_PATH   = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v2.5-regressor-v2.5_default.ckpt"
 OUTPUT_DIR   = "./results/benchmark"
 OUTPUT_JSON  = os.path.join(OUTPUT_DIR, "tabpfn_benchmark.json")
 OUTPUT_CSV   = os.path.join(OUTPUT_DIR, "tabpfn_benchmark.csv")
@@ -90,8 +91,7 @@ def make_data(n_rows: int, n_cols: int, seed: int = 42):
     X_df = pd.DataFrame(X, columns=[f"f{i}" for i in range(n_cols)])
     return X_df, y
 
-
-# ─────��──────────────────────────────────────────
+# ────────────────────────────────────────────────
 # 单次实验
 # ────────────────────────────────────────────────
 def run_single_experiment(n_rows, n_cols, device_cfg):
@@ -102,6 +102,10 @@ def run_single_experiment(n_rows, n_cols, device_cfg):
     cpu_threads    = device_cfg["cpu_threads"]
 
     print(f"\n  >> rows={n_rows}, cols={n_cols}, device={device_name}", flush=True)
+
+    # 检查模型文件是否存在
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"模型文件不存在: {MODEL_PATH}")
 
     # 设置 CPU 线程数
     original_threads = torch.get_num_threads()
@@ -118,20 +122,21 @@ def run_single_experiment(n_rows, n_cols, device_cfg):
     monitor.start()
 
     result = {
-        "n_rows":       n_rows,
-        "n_cols":       n_cols,
-        "device":       device_name,
-        "cpu_threads":  cpu_threads if cpu_threads else "N/A",
-        "fit_time_s":   None,
+        "n_rows":         n_rows,
+        "n_cols":         n_cols,
+        "device":         device_name,
+        "cpu_threads":    cpu_threads if cpu_threads else "N/A",
+        "fit_time_s":     None,
         "predict_time_s": None,
-        "total_time_s": None,
-        "peak_ram_mb":  None,
-        "peak_vram_mb": None,
-        "error":        None,
+        "total_time_s":   None,
+        "peak_ram_mb":    None,
+        "peak_vram_mb":   None,
+        "error":          None,
     }
 
     try:
         model = TabPFNRegressor(
+            model_path=MODEL_PATH,           # ← 指定本地模型路径
             device=device_str,
             n_estimators=N_ESTIMATORS,
             ignore_pretraining_limits=True,
@@ -187,11 +192,17 @@ def run_single_experiment(n_rows, n_cols, device_cfg):
 def main():
     print("=" * 65)
     print("TabPFN 性能基准测试")
+    print(f"  模型路径: {MODEL_PATH}")
     print(f"  行数: {ROW_SIZES}")
     print(f"  列数: {COL_SIZES}")
     print(f"  设备: {[d['name'] for d in DEVICE_CONFIGS]}")
     print(f"  n_estimators (基准): {N_ESTIMATORS}")
     print("=" * 65)
+
+    # 启动前检查模型文件
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ 模型文件不存在，请检查路径: {MODEL_PATH}")
+        return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     all_results = []
