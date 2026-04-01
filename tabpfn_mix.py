@@ -94,6 +94,24 @@ OOM_POLY_SCHEDULE = [20, 12, 8, 4, 1]
 ROLLING_CHUNK_LOTS_MIN = 1
 ROLLING_CHUNK_LOTS_MAX = 8
 
+# ============================================================
+# 分层混合训练配置 (Stratified Mixed-Mode)
+# ============================================================
+
+ENABLE_STRATIFIED_MIXED = True  # 启用分层混合训练
+
+# 性能阈值（基于 MAE 变化百分比）
+IMPROVE_THRESHOLD = -2.0   # MAE 变化 < -2%（降低 > 2%）→ 改善组
+DEGRADE_THRESHOLD = 5.0    # MAE 变化 > +5%（升高 > 5%）→ 单独训练组
+# 其他落在 [-2%, +5%] 之间 → 中性组，可安全混合
+
+# 分层混合输出目录
+STRATIFIED_OUTPUT_DIR = "/ossfs/workspace/xrfm/TabPFN-main/result/tool_all_fdc_1011_1229_stratified"
+os.makedirs(STRATIFIED_OUTPUT_DIR, exist_ok=True)
+
+# 最小混合组大小（少于此数量则回退单独训练）
+MIN_MIXED_GROUP_SIZE = 3
+
 
 # ============================================================
 # 数据加载
@@ -1095,6 +1113,253 @@ def run_mixed_pipeline(files):
 
 
 # ============================================================
+# 分层混合训练辅助函数
+# ============================================================
+
+def group_tools_by_performance(
+    single_results_csv,
+    mixed_per_tool_results,
+    improve_threshold=IMPROVE_THRESHOLD,
+    degrade_threshold=DEGRADE_THRESHOLD,
+):
+    """
+    根据混合训练 vs 单独训练的性能差异，自动分组 tools。
+
+    Args:
+        single_results_csv: 单独训练结果 CSV 路径
+        mixed_per_tool_results: 混合训练的 per-tool 结果字典
+        improve_threshold: 改善阈值（负数，如 -2.0 表示 MAE 降低 2%）
+        degrade_threshold: 退化阈值（正数，如 5.0 表示 MAE 增加 5%）
+
+    Returns:
+        dict with keys "improved", "neutral", "degraded", "changes"
+    """
+    single_df = pd.read_csv(single_results_csv)
+
+    # 构建 tool_name → single_mae 映射
+    single_mae_map = {}
+    for _, row in single_df.iterrows():
+        dataset = str(row.get("dataset", ""))
+        stem = os.path.splitext(dataset)[0]
+        parts = stem.rsplit("_", 2)
+        tool_name = parts[0] if len(parts) == 3 else stem
+        single_mae_map[tool_name] = float(row.get("mae", float("nan")))
+
+    # 计算每个 tool 的性能变化
+    changes = {}
+    for tool, metrics in mixed_per_tool_results.items():
+        mixed_mae = metrics.get("Baseline raw", {}).get("mae", float("nan"))
+        single_mae = single_mae_map.get(tool, None)
+
+        if single_mae is None:
+            print(f"  ⚠️ Tool {tool} 未在 single_results 中找到，跳过")
+            continue
+        if np.isnan(mixed_mae) or np.isnan(single_mae) or single_mae == 0:
+            continue
+
+        mae_change_pct = (mixed_mae - single_mae) / single_mae * 100
+        changes[tool] = mae_change_pct
+
+    # 分组
+    improved = [t for t, c in changes.items() if c < improve_threshold]
+    degraded = [t for t, c in changes.items() if c > degrade_threshold]
+    neutral = [t for t, c in changes.items() if improve_threshold <= c <= degrade_threshold]
+
+    print(f"\n{'='*70}")
+    print(f"  🔍 性能分组结果")
+    print(f"{'='*70}")
+    print(f"  ✅ 改善组 (MAE 变化 < {improve_threshold}%): {len(improved)} tools")
+    for t in sorted(improved, key=lambda x: changes[x]):
+        print(f"      {t:<30} {changes[t]:>6.1f}%")
+
+    print(f"\n  ➡️  中性组 ({improve_threshold}% ≤ MAE 变化 ≤ {degrade_threshold}%): {len(neutral)} tools")
+    for t in sorted(neutral, key=lambda x: changes[x])[:5]:
+        print(f"      {t:<30} {changes[t]:>6.1f}%")
+    if len(neutral) > 5:
+        print(f"      ... (还有 {len(neutral)-5} 个)")
+
+    print(f"\n  ⚠️  退化组 (MAE 变化 > {degrade_threshold}%): {len(degraded)} tools")
+    for t in sorted(degraded, key=lambda x: changes[x], reverse=True):
+        print(f"      {t:<30} {changes[t]:>6.1f}%")
+
+    return {
+        "improved": improved,
+        "neutral": neutral,
+        "degraded": degraded,
+        "changes": changes,
+    }
+
+
+def run_stratified_mixed_pipeline(files, grouping_result):
+    """
+    执行分层混合训练：
+    - 改善组 + 中性组 → 混合训练
+    - 退化组 → 使用单独训练结果（不重新训练）
+    """
+    improved = grouping_result["improved"]
+    neutral = grouping_result["neutral"]
+    mixed_tools = improved + neutral
+
+    if len(mixed_tools) < MIN_MIXED_GROUP_SIZE:
+        print(f"\n  ⚠️ 混合组只有 {len(mixed_tools)} 个 tools (< {MIN_MIXED_GROUP_SIZE})，跳过混合训练")
+        return None
+
+    print(f"\n{'#'*70}")
+    print(f"  🔀 分层混合训练 (Stratified Mixed): {len(mixed_tools)} tools")
+    print(f"{'#'*70}")
+    print(f"  包含工具: {mixed_tools}")
+
+    # 只加载混合组的数据文件
+    mixed_files = []
+    for filepath in files:
+        filename = os.path.basename(filepath)
+        stem = os.path.splitext(filename)[0]
+        parts = stem.rsplit("_", 2)
+        tool_name = parts[0] if len(parts) == 3 else stem
+        if tool_name in mixed_tools:
+            mixed_files.append(filepath)
+
+    if not mixed_files:
+        print(f"  ⚠️ 未找到混合组对应的数据文件，跳过")
+        return None
+
+    print(f"  加载 {len(mixed_files)} 个数据文件...")
+
+    combined_df = load_and_combine_all_tools_v2(mixed_files)
+
+    missing = [c for c in [TARGET_COL, SLOT_COL, TIME_COL] if c not in combined_df.columns]
+    if missing:
+        print(f"  ⚠️ 混合数据缺少列 {missing}，跳过分层混合训练")
+        return None
+
+    if len(combined_df) < 50:
+        print(f"  ⚠️ 混合数据量太少 ({len(combined_df)} 行)，跳过")
+        return None
+
+    return run_pipeline(
+        combined_df,
+        dataset_name="[Stratified Mixed] IMPROVED+NEUTRAL",
+        output_dir=STRATIFIED_OUTPUT_DIR,
+        is_mixed_mode=True,
+    )
+
+
+def evaluate_stratified_results(
+    single_results,
+    full_mixed_result,
+    stratified_mixed_result,
+    grouping_result,
+):
+    """
+    对比三种策略的性能：
+    1. 单独训练 (Baseline)
+    2. 全量混合训练 (原 mixed)
+    3. 分层混合训练 (NEW)
+    """
+    print(f"\n{'#'*70}")
+    print(f"  📊 三策略对比分析")
+    print(f"{'#'*70}")
+
+    single_metric_col = "Rolling raw"
+    mixed_metric_col = "Baseline raw"
+
+    # 构建单独训练的 per-tool 映射
+    single_by_tool = {}
+    for r in single_results:
+        for tn in r.get("tool_names", []):
+            single_by_tool[tn] = r["results"].get(single_metric_col, {})
+
+    # 全量混合的 per-tool
+    full_mixed_by_tool = full_mixed_result.get("per_tool_results", {}) if full_mixed_result else {}
+
+    # 分层混合的 per-tool（从混合推理结果中获取）
+    stratified_by_tool = {}
+    if stratified_mixed_result:
+        stratified_by_tool = dict(stratified_mixed_result.get("per_tool_results", {}))
+
+    # 对于退化组，使用单独训练结果填充
+    for tool in grouping_result["degraded"]:
+        if tool in single_by_tool:
+            stratified_by_tool[tool] = single_by_tool[tool]
+
+    all_tools = list(single_by_tool.keys())
+
+    def calc_avg_mae(per_tool_dict, metric_key=None):
+        maes = []
+        for t in all_tools:
+            if t not in per_tool_dict:
+                continue
+            entry = per_tool_dict[t]
+            if isinstance(entry, dict) and metric_key and metric_key in entry:
+                mae = entry[metric_key].get("mae", float("nan"))
+            elif isinstance(entry, dict) and "mae" in entry:
+                mae = entry.get("mae", float("nan"))
+            else:
+                continue
+            if not np.isnan(mae):
+                maes.append(mae)
+        return float(np.mean(maes)) if maes else float("nan")
+
+    # single_by_tool values are flat dicts with "mae" key (from Rolling raw)
+    single_avg = calc_avg_mae(single_by_tool)
+    # full_mixed_by_tool values are nested: {"Baseline raw": {...}, "Rolling raw": {...}}
+    full_mixed_avg = calc_avg_mae(
+        {t: v.get(mixed_metric_col, {}) for t, v in full_mixed_by_tool.items()},
+    )
+    # stratified_by_tool: degraded tools get flat single dicts, mixed tools get nested
+    strat_flat = {}
+    for t, v in stratified_by_tool.items():
+        if isinstance(v, dict) and mixed_metric_col in v:
+            strat_flat[t] = v[mixed_metric_col]
+        else:
+            strat_flat[t] = v
+    stratified_avg = calc_avg_mae(strat_flat)
+
+    print(f"\n  整体平均 MAE ({len(all_tools)} tools):")
+    print(f"  {'策略':<30} {'平均MAE':>10} {'vs单独':>10} {'vs全混合':>10}")
+    print(f"  {'─'*62}")
+    print(f"  {'单独训练 (Baseline)':<30} {single_avg:>10.4f}      -           -")
+    if not np.isnan(full_mixed_avg):
+        vs_single_full = (full_mixed_avg - single_avg) / single_avg * 100 if not np.isnan(single_avg) and single_avg else float("nan")
+        print(f"  {'全量混合 (Full Mixed)':<30} {full_mixed_avg:>10.4f} "
+              f"{vs_single_full:>9.1f}%        -")
+    if not np.isnan(stratified_avg):
+        vs_single_strat = (stratified_avg - single_avg) / single_avg * 100 if not np.isnan(single_avg) and single_avg else float("nan")
+        vs_full_strat = (stratified_avg - full_mixed_avg) / full_mixed_avg * 100 if not np.isnan(full_mixed_avg) and full_mixed_avg else float("nan")
+        print(f"  {'分层混合 (Stratified)':<30} {stratified_avg:>10.4f} "
+              f"{vs_single_strat:>9.1f}% "
+              f"{vs_full_strat:>9.1f}%")
+
+    # Per-tool 详细对比
+    print(f"\n  Per-Tool 对比 (按分层混合 vs 单独训练改善幅度排序):")
+    print(f"  {'Tool':<25} {'单独':>8} {'全混合':>8} {'分层':>8} {'分层改善':>10}")
+    print(f"  {'─'*73}")
+
+    changes = []
+    for tool in all_tools:
+        if tool not in strat_flat:
+            continue
+        single_mae = single_by_tool[tool].get("mae", float("nan"))
+        stratified_mae = strat_flat[tool].get("mae", float("nan"))
+        full_tool = full_mixed_by_tool.get(tool, {})
+        full_mae = full_tool.get(mixed_metric_col, {}).get("mae", float("nan")) if isinstance(full_tool, dict) and mixed_metric_col in full_tool else float("nan")
+        if np.isnan(single_mae) or np.isnan(stratified_mae):
+            continue
+        change_vs_single = (stratified_mae - single_mae) / single_mae * 100 if not np.isnan(single_mae) and single_mae else float("nan")
+        changes.append((tool, single_mae, full_mae, stratified_mae, change_vs_single))
+
+    for tool, s_mae, f_mae, st_mae, change in sorted(changes, key=lambda x: x[4])[:20]:
+        f_str = f"{f_mae:>8.4f}" if not np.isnan(f_mae) else f"{'N/A':>8}"
+        print(f"  {tool:<25} {s_mae:>8.4f} {f_str} {st_mae:>8.4f} {change:>9.1f}%")
+
+    return {
+        "single_avg": single_avg,
+        "full_mixed_avg": full_mixed_avg,
+        "stratified_avg": stratified_avg,
+    }
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -1220,6 +1485,46 @@ if __name__ == "__main__":
             force_cleanup()
     elif RUN_MIXED_MODE and len(files) == 1:
         print(f"\n⚠️  仅发现 1 个数据文件，无需混合推理（与单 tool 推理相同）")
+
+    # ============================================================
+    # 分层混合训练（Stage 3）
+    # ============================================================
+    stratified_result = None
+    if ENABLE_STRATIFIED_MIXED and mixed_result is not None and all_results:
+        try:
+            per_tool = mixed_result.get("per_tool_results", {})
+            if per_tool and os.path.exists(RESUME_SUMMARY_PATH):
+                grouping_result = group_tools_by_performance(
+                    single_results_csv=RESUME_SUMMARY_PATH,
+                    mixed_per_tool_results=per_tool,
+                    improve_threshold=IMPROVE_THRESHOLD,
+                    degrade_threshold=DEGRADE_THRESHOLD,
+                )
+
+                stratified_result = run_stratified_mixed_pipeline(files, grouping_result)
+
+                if stratified_result:
+                    summary = evaluate_stratified_results(
+                        single_results=all_results,
+                        full_mixed_result=mixed_result,
+                        stratified_mixed_result=stratified_result,
+                        grouping_result=grouping_result,
+                    )
+                    print(f"\n✅ 分层混合训练完成！")
+                    if not np.isnan(summary["stratified_avg"]) and not np.isnan(summary["single_avg"]) and summary["single_avg"]:
+                        print(f"   vs 单独训练: {(summary['stratified_avg']-summary['single_avg'])/summary['single_avg']*100:+.1f}%")
+                    if not np.isnan(summary["stratified_avg"]) and not np.isnan(summary["full_mixed_avg"]) and summary["full_mixed_avg"]:
+                        print(f"   vs 全量混合: {(summary['stratified_avg']-summary['full_mixed_avg'])/summary['full_mixed_avg']*100:+.1f}%")
+            else:
+                if not per_tool:
+                    print(f"\n  ⚠️ 混合推理无 per-tool 结果，跳过分层混合训练")
+                else:
+                    print(f"\n  ⚠️ 未找到 {RESUME_SUMMARY_PATH}，跳过分层混合训练")
+        except Exception as e:
+            print(f"\n  ❌ 分层混合训练失败: {e}")
+            import traceback
+            traceback.print_exc()
+            force_cleanup()
 
     # ============================================================
     # 最终对比汇总
