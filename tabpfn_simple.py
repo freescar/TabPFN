@@ -1,5 +1,6 @@
 import os
-os.environ["TABPFN_NO_TELEMETRY"] = "1"  
+os.environ["TABPFN_NO_TELEMETRY"] = "1"
+
 import glob
 import time
 import gc
@@ -15,10 +16,11 @@ import matplotlib.pyplot as plt
 
 import torch
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.feature_selection import f_regression
 
 from tabpfn import TabPFNRegressor
-import posthog
-posthog.disabled = True
+# import posthog
+# posthog.disabled = True
 
 warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Degrees of freedom")
@@ -26,11 +28,11 @@ warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 
 
 # ============================================================
-# Defaults (keep aligned with previous hard-coded values)
+# Defaults
 # ============================================================
 
 DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229/EPLBAB01_CHA1_1011_1229.parquet"
-DEFAULT_OUTPUT_DIR = "./results/EPLBAB01_CHA1_1101_1120_simple"
+DEFAULT_OUTPUT_DIR = "./results/EPLBAB01_CHA1_1101_1120_simple_fast"
 
 DEFAULT_TARGET_COL = "met"
 DEFAULT_TIME_COL = "start_time"
@@ -45,13 +47,19 @@ DEFAULT_VAL_RATIO = 0.8
 
 DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v2.5-regressor-v2.5_default.ckpt"
 
-DEFAULT_N_ESTIMATORS = 32
-DEFAULT_SOFTMAX_TEMPERATURE = 0.5
-DEFAULT_AVERAGE_BEFORE_SOFTMAX = False
+# ===== 最大提速导向默认值 =====
+DEFAULT_N_ESTIMATORS = 4
+DEFAULT_SOFTMAX_TEMPERATURE = 0.9
+DEFAULT_AVERAGE_BEFORE_SOFTMAX = True
 
-DEFAULT_POLY_FEATURES = 50
-DEFAULT_SUBSAMPLE_SAMPLES = 10_000
-DEFAULT_PREDICT_BATCH_SIZE = 200
+DEFAULT_POLY_FEATURES = 1
+DEFAULT_SUBSAMPLE_SAMPLES = 2048
+DEFAULT_PREDICT_BATCH_SIZE = 0   # 0 = whole test set once
+
+# 特征筛选
+DEFAULT_MAX_FEATURES = 120
+DEFAULT_MAX_MISSING_RATIO = 0.60
+DEFAULT_MIN_VARIANCE = 1e-10
 
 
 # ============================================================
@@ -83,11 +91,12 @@ def discover_files(path: str) -> list[str]:
 # GPU cleanup
 # ============================================================
 
-def force_cleanup() -> None:
+def force_cleanup(light: bool = True) -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if not light:
+            torch.cuda.synchronize()
 
 
 # ============================================================
@@ -120,7 +129,6 @@ def plot_pred_true_timeseries(
 
     plt.figure(figsize=(18, 6))
 
-    # ±0.5 band (visual for Acc@0.5)
     plt.fill_between(
         x,
         y_test - 0.5,
@@ -130,12 +138,10 @@ def plot_pred_true_timeseries(
         label="±0.5 band",
     )
 
-    # True
     plt.plot(x, y_test, color="black", alpha=0.35, linewidth=1.0, label="true (all)")
     plt.scatter(x[is_nonref], y_test[is_nonref], s=8, color="black", alpha=0.6, label="true (non-ref)")
     plt.scatter(x[test_is_ref], y_test[test_is_ref], s=8, color="gray", alpha=0.4, label="true (ref)")
 
-    # Pred (comp)
     plt.plot(x, y_pred, color="steelblue", alpha=0.55, linewidth=1.2, label="pred (comp)")
     plt.scatter(x[is_nonref], y_pred[is_nonref], s=8, color="steelblue", alpha=0.6, label="pred (comp, non-ref)")
     plt.scatter(x[test_is_ref], y_pred[test_is_ref], s=8, color="salmon", alpha=0.4, label="pred (comp, ref)")
@@ -158,11 +164,6 @@ def apply_residual_compensation(
     slot_col: str,
     reference_slot_ids: list[int],
 ) -> np.ndarray:
-    """
-    Residual compensation baseline:
-      For each lot, compute bias = mean(y_true_ref - y_pred_ref) using reference wafers,
-      then add the bias to non-reference wafers within the same lot.
-    """
     compensated = y_pred.copy()
     lots = df_meta[lot_col].values
     slots = df_meta[slot_col].values
@@ -186,6 +187,92 @@ def apply_residual_compensation(
 
 
 # ============================================================
+# Fast feature pruning
+# ============================================================
+
+def _coerce_mixed_columns_for_tabpfn(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+
+    # object列尽量转category，数值列转float32
+    for c in X.columns:
+        dt = X[c].dtype
+        if pd.api.types.is_object_dtype(dt):
+            nunique = X[c].nunique(dropna=True)
+            if nunique <= max(100, int(len(X) * 0.2)):
+                X[c] = X[c].astype("category")
+        elif pd.api.types.is_numeric_dtype(dt):
+            X[c] = X[c].astype(np.float32)
+
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > 0:
+        X[num_cols] = X[num_cols].replace([np.inf, -np.inf], np.nan)
+
+    return X
+
+
+def fast_select_features(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_all: pd.DataFrame,
+    *,
+    max_features: int,
+    max_missing_ratio: float,
+    min_variance: float,
+) -> tuple[pd.DataFrame, list[str], dict]:
+    info = {
+        "raw_features": int(X_all.shape[1]),
+        "after_missing_filter": 0,
+        "after_variance_filter": 0,
+        "after_score_filter": 0,
+    }
+
+    cols = list(X_train.columns)
+    if not cols:
+        return X_all, cols, info
+
+    # 1) 缺失率过滤
+    miss_ratio = X_train.isna().mean()
+    keep_cols = miss_ratio[miss_ratio <= max_missing_ratio].index.tolist()
+    if not keep_cols:
+        keep_cols = cols
+    X_train_1 = X_train[keep_cols]
+    info["after_missing_filter"] = int(len(keep_cols))
+
+    # 2) 只对数值列做打分筛选；非数值列暂时丢弃（最大提速优先）
+    num_cols = X_train_1.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        # 如果一个数值列都没有，就退化成前max_features列
+        selected = keep_cols[:max_features]
+        info["after_variance_filter"] = int(len(selected))
+        info["after_score_filter"] = int(len(selected))
+        return X_all[selected], selected, info
+
+    X_num = X_train_1[num_cols]
+
+    # 3) 低方差过滤
+    variances = X_num.var(axis=0, skipna=True)
+    keep_num_cols = variances[variances > min_variance].index.tolist()
+    if not keep_num_cols:
+        keep_num_cols = num_cols
+    X_num = X_num[keep_num_cols]
+    info["after_variance_filter"] = int(len(keep_num_cols))
+
+    # 4) 单变量打分，选 top-K
+    X_fill = X_num.fillna(X_num.median(numeric_only=True))
+    try:
+        scores, _ = f_regression(X_fill, y_train)
+        scores = np.nan_to_num(scores, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        order = np.argsort(scores)[::-1]
+        top_idx = order[: min(max_features, len(keep_num_cols))]
+        selected = [keep_num_cols[i] for i in top_idx]
+    except Exception:
+        selected = keep_num_cols[:max_features]
+
+    info["after_score_filter"] = int(len(selected))
+    return X_all[selected], selected, info
+
+
+# ============================================================
 # TabPFN
 # ============================================================
 
@@ -197,6 +284,9 @@ def create_model(
     poly_features: int,
     subsample_samples: int,
 ) -> TabPFNRegressor:
+    poly_features = max(1, int(poly_features))
+    subsample_samples = max(256, int(subsample_samples))
+
     return TabPFNRegressor(
         model_path=model_path,
         device="cuda",
@@ -212,10 +302,10 @@ def create_model(
     )
 
 
-def batched_predict(model: TabPFNRegressor, X: pd.DataFrame, batch_size: int) -> np.ndarray:
-    """
-    IMPORTANT: Keep X as a DataFrame to support string/categorical features.
-    """
+def predict_maybe_batched(model: TabPFNRegressor, X: pd.DataFrame, batch_size: int) -> np.ndarray:
+    if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
+        return model.predict(X)
+
     preds = []
     for i in range(0, len(X), batch_size):
         preds.append(model.predict(X.iloc[i:i + batch_size]))
@@ -246,18 +336,20 @@ def infer_one_dataset(
     poly_features: int,
     subsample_samples: int,
     predict_batch_size: int,
+    max_features: int,
+    max_missing_ratio: float,
+    min_variance: float,
 ) -> dict | None:
-    # required cols
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
     if missing:
         print(f"  ⚠️ skip {dataset_name}: missing {missing}")
         return None
 
-    # sort by time
+    t_sort0 = time.time()
     df = df.sort_values(time_col, ascending=True).reset_index(drop=True)
+    t_sort = time.time() - t_sort0
 
-    # lot_id for compensation
     if lot_col in df.columns:
         lot_ids = df[lot_col].astype(str)
     elif wafer_id_col in df.columns:
@@ -272,11 +364,9 @@ def infer_one_dataset(
         print(f"  ⚠️ skip {dataset_name}: too small n={n_total}")
         return None
 
-    # split
     _train_end = int(n_total * train_ratio)
     val_end = int(n_total * val_ratio)
 
-    # feature columns = everything except meta/label/time
     drop_cols = {target_col, time_col, slot_col, lot_col}
     if wafer_id_col in df.columns:
         drop_cols.add(wafer_id_col)
@@ -286,16 +376,21 @@ def infer_one_dataset(
         print(f"  ⚠️ skip {dataset_name}: no feature columns after dropping meta cols")
         return None
 
-    # X as DataFrame (keep strings/categorical)
-    X = df[feature_cols].copy()
-
-    # numeric inf -> NaN only
-    num_cols = X.select_dtypes(include=[np.number]).columns
-    if len(num_cols) > 0:
-        X[num_cols] = X[num_cols].replace([np.inf, -np.inf], np.nan)
-
-    # y numeric
+    t_prep0 = time.time()
+    X_raw = df[feature_cols]
     y = df[target_col].astype(float).to_numpy(dtype=np.float32)
+    X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
+
+    X_train_for_select = X_raw.iloc[:val_end]
+    X_selected, selected_cols, fs_info = fast_select_features(
+        X_train=X_train_for_select,
+        y_train=y[:val_end],
+        X_all=X_raw,
+        max_features=max_features,
+        max_missing_ratio=max_missing_ratio,
+        min_variance=min_variance,
+    )
+    t_prep = time.time() - t_prep0
 
     slots = df[slot_col].to_numpy()
     test_is_ref = np.isin(slots[val_end:], reference_slot_ids)
@@ -304,8 +399,14 @@ def infer_one_dataset(
         print(f"  ⚠️ skip {dataset_name}: no non-ref rows in test")
         return None
 
-    # fit(train+val) -> predict(test)
-    t0 = time.time()
+    print(
+        f"  feature pruning: raw={fs_info['raw_features']} -> "
+        f"miss={fs_info['after_missing_filter']} -> "
+        f"var={fs_info['after_variance_filter']} -> "
+        f"final={fs_info['after_score_filter']}"
+    )
+
+    t_fit0 = time.time()
     model = create_model(
         model_path=model_path,
         n_estimators=n_estimators,
@@ -314,13 +415,19 @@ def infer_one_dataset(
         poly_features=poly_features,
         subsample_samples=subsample_samples,
     )
-    model.fit(X.iloc[:val_end], y[:val_end])
-    y_pred_raw = batched_predict(model, X.iloc[val_end:], batch_size=predict_batch_size)
-    del model
-    force_cleanup()
-    infer_time = time.time() - t0
+    model.fit(X_selected.iloc[:val_end], y[:val_end])
+    t_fit = time.time() - t_fit0
 
-    # compensation
+    t_pred0 = time.time()
+    y_pred_raw = predict_maybe_batched(model, X_selected.iloc[val_end:], batch_size=predict_batch_size)
+    t_pred = time.time() - t_pred0
+
+    infer_time = t_fit + t_pred
+
+    del model
+    force_cleanup(light=True)
+
+    t_comp0 = time.time()
     meta_test = pd.DataFrame(
         {
             lot_col: lot_ids.iloc[val_end:].to_numpy(),
@@ -336,9 +443,11 @@ def infer_one_dataset(
         slot_col=slot_col,
         reference_slot_ids=reference_slot_ids,
     )
+    t_comp = time.time() - t_comp0
 
     metrics = eval_metrics(y_test[test_is_nonref], y_pred[test_is_nonref])
 
+    t_plot0 = time.time()
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_path = os.path.join(output_dir, f"{safe}_infer_timeseries.png")
     plot_pred_true_timeseries(
@@ -352,11 +461,18 @@ def infer_one_dataset(
         out_path=plot_path,
         ylabel=target_col,
     )
+    t_plot = time.time() - t_plot0
+
+    print(
+        f"  timing: sort={t_sort:.2f}s prep={t_prep:.2f}s "
+        f"fit={t_fit:.2f}s pred={t_pred:.2f}s comp={t_comp:.2f}s plot={t_plot:.2f}s"
+    )
 
     return {
         "dataset": dataset_name,
         "n_rows": int(n_total),
-        "n_features": int(len(feature_cols)),
+        "n_features_raw": int(len(feature_cols)),
+        "n_features_used": int(len(selected_cols)),
         "n_test": int(n_total - val_end),
         "n_test_nonref": int(test_is_nonref.sum()),
         "time_sec": float(infer_time),
@@ -378,25 +494,21 @@ def _parse_reference_slot_ids(s: str) -> list[int]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="TabPFN baseline inference with per-lot residual compensation using reference slots."
+        description="Fast TabPFN baseline inference with aggressive feature pruning and per-lot residual compensation."
     )
 
-    # data / output
     p.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH, help="Input file or folder (csv/parquet).")
     p.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Output folder for plots/results.")
 
-    # column names
     p.add_argument("--target-col", type=str, default=DEFAULT_TARGET_COL)
     p.add_argument("--time-col", type=str, default=DEFAULT_TIME_COL)
     p.add_argument("--slot-col", type=str, default=DEFAULT_SLOT_COL)
     p.add_argument("--lot-col", type=str, default=DEFAULT_LOT_COL)
     p.add_argument("--wafer-id-col", type=str, default=DEFAULT_WAFER_ID_COL)
 
-    # split
     p.add_argument("--train-ratio", type=float, default=DEFAULT_TRAIN_RATIO)
     p.add_argument("--val-ratio", type=float, default=DEFAULT_VAL_RATIO)
 
-    # reference slots
     p.add_argument(
         "--reference-slot-ids",
         type=str,
@@ -404,7 +516,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help='Comma-separated slot ids, e.g. "2,3,4,5,12,13,20,21,22,23".',
     )
 
-    # model / inference config
     p.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     p.add_argument("--n-estimators", type=int, default=DEFAULT_N_ESTIMATORS)
     p.add_argument("--softmax-temperature", type=float, default=DEFAULT_SOFTMAX_TEMPERATURE)
@@ -416,7 +527,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--poly-features", type=int, default=DEFAULT_POLY_FEATURES)
     p.add_argument("--subsample-samples", type=int, default=DEFAULT_SUBSAMPLE_SAMPLES)
-    p.add_argument("--predict-batch-size", type=int, default=DEFAULT_PREDICT_BATCH_SIZE)
+    p.add_argument(
+        "--predict-batch-size",
+        type=int,
+        default=DEFAULT_PREDICT_BATCH_SIZE,
+        help="0 means predict all test rows at once.",
+    )
+
+    p.add_argument("--max-features", type=int, default=DEFAULT_MAX_FEATURES)
+    p.add_argument("--max-missing-ratio", type=float, default=DEFAULT_MAX_MISSING_RATIO)
+    p.add_argument("--min-variance", type=float, default=DEFAULT_MIN_VARIANCE)
 
     return p
 
@@ -462,6 +582,9 @@ def main() -> None:
                 poly_features=args.poly_features,
                 subsample_samples=args.subsample_samples,
                 predict_batch_size=args.predict_batch_size,
+                max_features=args.max_features,
+                max_missing_ratio=args.max_missing_ratio,
+                min_variance=args.min_variance,
             )
             if res is not None:
                 all_results.append(res)
@@ -469,14 +592,15 @@ def main() -> None:
                 print(
                     f"  COMP Non-ref: MAE={m['mae']:.4f} R²={m['r2']:.4f} "
                     f"Acc@0.5={m['acc05']:.1f}% Acc@1.0={m['acc10']:.1f}% "
-                    f"| time={res['time_sec']:.1f}s"
+                    f"| time={res['time_sec']:.1f}s "
+                    f"| features={res['n_features_raw']}->{res['n_features_used']}"
                 )
                 print(f"  plot={res['plot']}")
         except Exception as e:
-            print(f"  ❌ failed: {e}")
+            print(f"  ❌ failed: {type(e).__name__}: {e}")
         finally:
             del df
-            force_cleanup()
+            force_cleanup(light=True)
 
     print(f"\nDone. success={len(all_results)}/{len(files)} total_time={time.time()-t_all:.1f}s")
 
@@ -492,3 +616,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    print("Process finished, exiting now...", flush=True)
+    os._exit(0)
