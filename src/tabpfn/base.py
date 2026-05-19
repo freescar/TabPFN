@@ -1,12 +1,13 @@
 """Common logic for TabPFN models."""
 
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 from __future__ import annotations
 
 import pathlib
 import typing
 from collections.abc import Sequence
+from inspect import signature
 from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
@@ -26,12 +27,15 @@ from tabpfn.constants import (
 from tabpfn.errors import TabPFNValidationError
 from tabpfn.inference import (
     InferenceEngine,
-    InferenceEngineBatchedNoPreprocessing,
     InferenceEngineCacheKV,
     InferenceEngineCachePreprocessing,
+    InferenceEngineExplicitKVCache,
     InferenceEngineOnDemand,
 )
-from tabpfn.model_loading import load_model_criterion_config, resolve_model_version
+from tabpfn.model_loading import (
+    load_model_criterion_config,
+    resolve_model_version,
+)
 from tabpfn.preprocessing.clean import fix_dtypes
 from tabpfn.utils import (
     DevicesSpecification,
@@ -46,7 +50,6 @@ if TYPE_CHECKING:
     from tabpfn.architectures.interface import Architecture, ArchitectureConfig
     from tabpfn.classifier import TabPFNClassifier
     from tabpfn.inference_config import InferenceConfig
-    from tabpfn.preprocessing.datamodel import FeatureSchema
     from tabpfn.preprocessing.ensemble import TabPFNEnsemblePreprocessor
     from tabpfn.regressor import TabPFNRegressor
 
@@ -276,7 +279,6 @@ def create_inference_engine(  # noqa: PLR0913
     fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache", "batched"],
     X_train: np.ndarray,
     y_train: np.ndarray,
-    feature_schema: FeatureSchema,
     ensemble_preprocessor: TabPFNEnsemblePreprocessor,
     models: list[Architecture],
     devices_: Sequence[torch.device],
@@ -297,7 +299,6 @@ def create_inference_engine(  # noqa: PLR0913
         fit_mode: Determines how we prepare inference (pre-cache or not).
         X_train: Training features
         y_train: Training target
-        feature_schema: The feature schema.
         ensemble_preprocessor: The ensemble preprocessor to use.
         models: The loaded TabPFN models.
         devices_: The devices for inference.
@@ -312,7 +313,6 @@ def create_inference_engine(  # noqa: PLR0913
         return InferenceEngineOnDemand(
             X_train=X_train,
             y_train=y_train,
-            feature_schema=feature_schema,
             ensemble_preprocessor=ensemble_preprocessor,
             models=models,
             devices=devices_,
@@ -324,7 +324,6 @@ def create_inference_engine(  # noqa: PLR0913
         return InferenceEngineCachePreprocessing(
             X_train=X_train,
             y_train=y_train,
-            feature_schema=feature_schema,
             ensemble_preprocessor=ensemble_preprocessor,
             models=models,
             devices=devices_,
@@ -334,10 +333,26 @@ def create_inference_engine(  # noqa: PLR0913
             inference_mode=inference_mode,
         )
     if fit_mode == "fit_with_cache":
+        # Use explicit KV cache engine for models that support it (e.g. v3),
+        # fall back to model-internal KV cache engine for older architectures.
+        _uses_explicit_cache = any(
+            "return_kv_cache" in signature(m.forward).parameters for m in models
+        )
+        if _uses_explicit_cache:
+            return InferenceEngineExplicitKVCache(
+                X_train=X_train,
+                y_train=y_train,
+                ensemble_preprocessor=ensemble_preprocessor,
+                models=models,
+                devices=devices_,
+                dtype_byte_size=byte_size,
+                force_inference_dtype=forced_inference_dtype_,
+                save_peak_mem=memory_saving_mode,
+                autocast=use_autocast_,
+            )
         return InferenceEngineCacheKV(
             X_train=X_train,
             y_train=y_train,
-            feature_schema=feature_schema,
             ensemble_preprocessor=ensemble_preprocessor,
             models=models,
             devices=devices_,
@@ -347,17 +362,9 @@ def create_inference_engine(  # noqa: PLR0913
             autocast=use_autocast_,
         )
     if fit_mode == "batched":
-        return InferenceEngineBatchedNoPreprocessing(
-            X_trains=X_train,  # pyright: ignore[reportArgumentType]
-            y_trains=y_train,  # pyright: ignore[reportArgumentType]
-            feature_schema=feature_schema,  # pyright: ignore[reportArgumentType]
-            ensemble_configs=ensemble_preprocessor.configs,  # pyright: ignore[reportArgumentType]
-            models=models,
-            devices=devices_,
-            dtype_byte_size=byte_size,
-            force_inference_dtype=forced_inference_dtype_,
-            save_peak_mem=memory_saving_mode,
-            inference_mode=inference_mode,
+        raise ValueError(
+            "InferenceEngineBatchedNoPreprocessing should be initialized directly "
+            "rather than through create_inference_engine."
         )
 
     raise ValueError(f"Invalid fit_mode: {fit_mode}")

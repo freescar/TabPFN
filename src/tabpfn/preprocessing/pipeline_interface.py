@@ -1,8 +1,11 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Interfaces for creating preprocessing pipelines."""
 
 from __future__ import annotations
 
 import dataclasses
+import time
 from abc import abstractmethod
 from typing_extensions import TypeAlias
 
@@ -148,6 +151,11 @@ class PreprocessingStep:
         Returns:
             PreprocessingStepResult with transformed data and updated feature schema.
         """
+        # Reset cached validation state so re-fitting is safe.
+        if hasattr(self, "n_added_columns_"):
+            del self.n_added_columns_
+        if hasattr(self, "modality_added_"):
+            del self.modality_added_
         self.feature_schema_updated_ = self._fit(X, feature_schema)
         return self.transform(X, is_test=False)
 
@@ -176,6 +184,23 @@ class PreprocessingStep:
             X_added=X_added,
             modality_added=modality_added,
         )
+
+    def num_added_features(self, n_samples: int, feature_schema: FeatureSchema) -> int:
+        """Return the number of added features.
+
+        This needs to be overridden by subclasses that add features.
+        """
+        del n_samples, feature_schema
+        return 0
+
+    def has_data_dependent_feature_expansion(self) -> bool:
+        """Return True if this step's feature expansion depends on data values.
+
+        Override to return True for steps where ``num_added_features()`` is an
+        approximation because the true count depends on fitting data (e.g.
+        one-hot encoding cardinality).
+        """
+        return False
 
     def _validate_added_data(
         self,
@@ -240,6 +265,14 @@ class PreprocessingPipeline:
         self._raw_steps = steps
         self.steps = self._validate_steps(steps)
 
+    step_timings_: dict[str, float] | None
+    """Per-step wall-clock time (seconds) from the last ``fit_transform`` or
+    ``transform`` call.  Keyed by ``<index>_<ClassName>``.
+    Only populated when ``record_timings=True``."""
+
+    record_timings: bool = False
+    """Set to ``True`` to collect per-step wall-clock timings."""
+
     def fit_transform(
         self,
         X: np.ndarray | torch.Tensor,
@@ -278,6 +311,29 @@ class PreprocessingPipeline:
         )
         return PreprocessingPipelineResult(X=X, feature_schema=updated_schema)
 
+    def num_added_features(self, n_samples: int, feature_schema: FeatureSchema) -> int:
+        """Return the number of added features.
+
+        Threads an evolving feature schema through the steps so that each step
+        sees the feature count that includes columns added by prior steps.
+        """
+        total_added = 0
+        current_schema = feature_schema
+        for step, _ in self.steps:
+            added = step.num_added_features(n_samples, current_schema)
+            total_added += added
+            if added > 0:
+                current_schema = current_schema.append_columns(
+                    FeatureModality.NUMERICAL, added
+                )
+        return total_added
+
+    def has_data_dependent_feature_expansion(self) -> bool:
+        """Return True if any step has data-dependent feature expansion."""
+        return any(
+            step.has_data_dependent_feature_expansion() for step, _ in self.steps
+        )
+
     def _process_steps(
         self,
         X: np.ndarray | torch.Tensor,
@@ -299,7 +355,11 @@ class PreprocessingPipeline:
         # inside the loop for steps that target specific modalities.
         X = X.copy() if isinstance(X, np.ndarray) else X.clone()
 
-        for step, modalities in self.steps:
+        self.step_timings_ = {} if self.record_timings else None
+        for step_idx, (step, modalities) in enumerate(self.steps):
+            if self.record_timings:
+                t0 = time.perf_counter()
+
             if modalities:
                 indices = feature_schema.indices_for_modalities(modalities)
                 if not indices:
@@ -345,6 +405,10 @@ class PreprocessingPipeline:
                 X, feature_schema = self._maybe_append_added_columns(
                     X, feature_schema, result
                 )
+
+            if self.record_timings:
+                step_key = f"{step_idx}_{step.__class__.__name__}"
+                self.step_timings_[step_key] = time.perf_counter() - t0
 
         return X, feature_schema
 

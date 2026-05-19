@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Check that preprocessing pipeline output matches reference transformations.
 
 This ensures that the preprocessing behavior does not change unintentionally
@@ -109,7 +111,6 @@ def _create_ensemble_config(
         polynomial_features=polynomial_features,
         feature_shift_count=feature_shift_count,
         feature_shift_decoder=feature_shift_decoder,
-        subsample_ix=None,
         outlier_removal_std=None,
         _model_index=0,
     )

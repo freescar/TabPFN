@@ -1,4 +1,4 @@
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 """Interfaces for encoders."""
 
@@ -10,6 +10,8 @@ from typing_extensions import override
 
 import torch
 from torch import nn
+
+from tabpfn.architectures.shared.compile_utils import lazy_compiler_disable
 
 
 # Note that inheriting from nn.Sequential is not strictly necessary, because
@@ -38,7 +40,7 @@ class TorchPreprocessingPipeline(torch.nn.Sequential):
 
     # For now, we disable compilation for the preprocessing pipeline because
     # there are multiple data-dependent control flows in the steps that break the graph.
-    @torch.compiler.disable
+    @lazy_compiler_disable
     @override
     def forward(
         self,

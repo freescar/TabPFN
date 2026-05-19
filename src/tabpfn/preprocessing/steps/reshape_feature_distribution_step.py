@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Reshape the feature distributions using different transformations."""
 
 from __future__ import annotations
@@ -17,12 +19,19 @@ from sklearn.preprocessing import (
     RobustScaler,
 )
 
-from tabpfn.preprocessing.datamodel import FeatureModality, FeatureSchema
+from tabpfn.preprocessing.datamodel import (
+    Feature,
+    FeatureModality,
+    FeatureSchema,
+    GPUTransformType,
+)
 from tabpfn.preprocessing.pipeline_interface import (
     PreprocessingStep,
+    PreprocessingStepResult,
 )
 from tabpfn.preprocessing.steps.adaptive_quantile_transformer import (
     AdaptiveQuantileTransformer,
+    get_user_n_quantiles_for_preset,
 )
 from tabpfn.preprocessing.steps.kdi_transformer import (
     KDITransformerWithNaN,
@@ -65,12 +74,8 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
     """Reshape feature distributions using various transformations.
 
     This step should receive ALL columns (not modality-sliced) because it:
-    1. Handles feature subsampling when too many features exist
-    2. Applies different logic based on `apply_to_categorical` flag
-    3. Can append transformed features to originals (`append_to_original`)
-
-    # TODO(ben): Add separate PreprocessingStep's for all of the above
-    # so that we can register this with modalities
+    1. Applies different logic based on `apply_to_categorical` flag
+    2. Can append transformed features to originals (`append_to_original`)
 
     When using with PreprocessingPipeline, register as a bare step (no modalities):
         pipeline = PreprocessingPipeline(steps=[ReshapeFeatureDistributionsStep()])
@@ -94,6 +99,8 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
     """
 
     APPEND_TO_ORIGINAL_THRESHOLD = 500
+    """Threshold to allow appending the original features if append_to_original is
+    auto. This is used to reduce computational cost."""
 
     @staticmethod
     def get_column_types(X: np.ndarray) -> list[str]:
@@ -129,7 +136,38 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         append_to_original: bool | Literal["auto"] = False,
         max_features_per_estimator: int = 500,
         random_state: int | np.random.Generator | None = None,
+        schedule_gpu_transform: GPUTransformType | None = None,
     ):
+        """Initialize the step.
+
+        Args:
+            transform_name: Key into
+                :func:`get_all_reshape_feature_distribution_preprocessors`
+                selecting the transform to apply (e.g. ``"safepower"``,
+                ``"quantile_uni_coarse"``, ``"squashing_scaler_default"``).
+                Use ``"none"`` to disable the transform itself while still
+                running this step's schema logic (e.g. when the actual
+                transform will run on GPU — see ``schedule_gpu_transform``).
+            apply_to_categorical: If True, the transform is applied to
+                categorical columns as well as numerical ones. If False,
+                categorical columns pass through unchanged.
+            append_to_original: If True, transformed columns are appended to
+                the original columns instead of replacing them. If
+                ``"auto"``, this is decided based on the number of features
+                (see :attr:`APPEND_TO_ORIGINAL_THRESHOLD` and
+                ``max_features_per_estimator``).
+            max_features_per_estimator: Upper bound on the number of
+                features the downstream estimator should see. Used by the
+                ``"auto"`` decision for ``append_to_original``.
+            random_state: Random state used by stochastic transforms (e.g.
+                quantile transformers) and the ``"per_feature"`` random
+                selection.
+            schedule_gpu_transform: When set, marks the output numerical
+                columns with this :class:`GPUTransformType` so the GPU
+                preprocessing pipeline picks them up. The CPU transform
+                itself is not skipped — pass ``transform_name="none"`` to
+                let the GPU side do the actual work.
+        """
         super().__init__()
 
         if max_features_per_estimator <= 0:
@@ -140,6 +178,7 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         self.append_to_original = append_to_original
         self.random_state = random_state
         self.max_features_per_estimator = max_features_per_estimator
+        self.schedule_gpu_transform = schedule_gpu_transform
         self.transformer_: Pipeline | ColumnTransformer | None = None
 
     def _create_transformers_and_new_schema(
@@ -158,48 +197,25 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
             n_samples,
             random_state=static_seed,
         )
-        if n_features > self.max_features_per_estimator:
-            subsample_features = self.max_features_per_estimator
-            self.subsampled_features_ = rng.choice(
-                list(range(n_features)),
-                subsample_features,
-                replace=False,
-            )
-            # Update modalities to reflect subsampled features
-            # Create a new schema with only the kept indices
-            kept_indices = list(self.subsampled_features_)
-            feature_schema = feature_schema.slice_for_indices(kept_indices)
-            categorical_features = feature_schema.indices_for(
-                FeatureModality.CATEGORICAL
-            )
-            n_features = subsample_features
-        else:
-            self.subsampled_features_ = np.arange(n_features)
-
         all_feats_ix = list(range(n_features))
         transformers = []
 
         numerical_ix = [i for i in range(n_features) if i not in categorical_features]
 
-        append_decision = (
-            n_features < self.APPEND_TO_ORIGINAL_THRESHOLD
-            and n_features < (self.max_features_per_estimator / 2)
-        )
-        self.append_to_original = (
-            append_decision
-            if self.append_to_original == "auto"
-            else self.append_to_original
+        self.append_to_original_decision_ = self._get_append_to_original_decision(
+            n_features=n_features,
+            max_features_per_estimator=self.max_features_per_estimator,
         )
 
         # -------- Append to original ------
         # If we append to original, all the categorical indices are kept in place
         # as the first transform is a passthrough on the whole X as it is above
-        if self.append_to_original and self.apply_to_categorical:
+        if self.append_to_original_decision_ and self.apply_to_categorical:
             trans_ixs = categorical_features + numerical_ix
             transformers.append(("original", "passthrough", all_feats_ix))
             cat_ix = categorical_features  # Exist as they are in original
 
-        elif self.append_to_original and not self.apply_to_categorical:
+        elif self.append_to_original_decision_ and not self.apply_to_categorical:
             trans_ixs = numerical_ix
             # Includes the categoricals passed through
             transformers.append(("original", "passthrough", all_feats_ix))
@@ -209,11 +225,11 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         # We only have categorical indices if we don't transform them
         # The first transformer will be a passthrough on the categorical indices
         # Making them the first
-        elif not self.append_to_original and self.apply_to_categorical:
+        elif not self.append_to_original_decision_ and self.apply_to_categorical:
             trans_ixs = categorical_features + numerical_ix
             cat_ix = []  # We have none left, they've been transformed
 
-        elif not self.append_to_original and not self.apply_to_categorical:
+        elif not self.append_to_original_decision_ and not self.apply_to_categorical:
             trans_ixs = numerical_ix
             transformers.append(("cats", "passthrough", categorical_features))
             cat_ix = list(range(len(categorical_features)))  # They are at start
@@ -221,7 +237,7 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         else:
             raise ValueError(
                 f"Unrecognized combination of {self.apply_to_categorical=}"
-                f" and {self.append_to_original=}",
+                f" and {self.append_to_original_decision_=}",
             )
 
         # NOTE: No need to keep track of categoricals here, already done above
@@ -248,7 +264,9 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         # Compute output feature count for modality update
         # Include: base features + appended transformed (if append_to_original)
         n_output_features = (
-            n_features + len(trans_ixs) if self.append_to_original else n_features
+            n_features + len(trans_ixs)
+            if self.append_to_original_decision_
+            else n_features
         )
 
         # Build the new metadata with updated categorical indices
@@ -257,6 +275,24 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
             categorical_indices=sorted(cat_ix),
             num_columns=n_output_features,
         )
+
+        if self.schedule_gpu_transform is not None:
+            if self.append_to_original_decision_:
+                # Output: [original_all, transformed_copies]
+                # The appended copies are the GPU transform targets.
+                gpu_target = range(n_features, n_output_features)
+            else:
+                # All NUMERICAL columns in the output are the targets.
+                # (Using schema indices rather than trans_ixs because the
+                # ColumnTransformer may reorder columns, e.g. cats first.)
+                gpu_target = new_schema.indices_for(FeatureModality.NUMERICAL)
+            for idx in gpu_target:
+                f = new_schema.features[idx]
+                new_schema.features[idx] = Feature(
+                    name=f.name,
+                    modality=f.modality,
+                    scheduled_gpu_transform=self.schedule_gpu_transform,
+                )
 
         return transformer, new_schema
 
@@ -272,7 +308,7 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
             n_features,
             feature_schema,
         )
-        transformer.fit(X[:, self.subsampled_features_])
+        transformer.fit(X)
         self.transformer_ = transformer
         return output_schema
 
@@ -281,7 +317,77 @@ class ReshapeFeatureDistributionsStep(PreprocessingStep):
         self, X: np.ndarray, *, is_test: bool = False
     ) -> tuple[np.ndarray, np.ndarray | None, FeatureModality | None]:
         assert self.transformer_ is not None, "You must call fit first"
-        return self.transformer_.transform(X[:, self.subsampled_features_]), None, None  # type: ignore
+        return self.transformer_.transform(X), None, None
+
+    @override
+    def fit_transform(
+        self,
+        X: np.ndarray,
+        feature_schema: FeatureSchema,
+    ) -> PreprocessingStepResult:
+        # The default base-class implementation calls ``_fit`` then
+        # ``_transform``. ``_fit`` here calls ``ColumnTransformer.fit(X)``,
+        # whose sklearn implementation runs ``fit_transform(X)`` internally and
+        # discards the result. ``_transform`` then runs the transform a second
+        # time. For a 100k x 100 squashing-scaler workload that doubled pass
+        # costs ~675 ms.  Doing the fit and transform in one call avoids it.
+        if hasattr(self, "n_added_columns_"):
+            del self.n_added_columns_
+        if hasattr(self, "modality_added_"):
+            del self.modality_added_
+
+        n_samples, n_features = X.shape
+        transformer, output_schema = self._create_transformers_and_new_schema(
+            n_samples,
+            n_features,
+            feature_schema,
+        )
+        x_transformed = transformer.fit_transform(X)
+        self.transformer_ = transformer
+        self.feature_schema_updated_ = output_schema
+
+        self._validate_added_data(X_added=None, modality_added=None)
+
+        return PreprocessingStepResult(
+            X=x_transformed,
+            feature_schema=output_schema,
+            X_added=None,
+            modality_added=None,
+        )  # type: ignore
+
+    def _get_append_to_original_decision(
+        self,
+        n_features: int,
+        max_features_per_estimator: int,
+    ) -> bool:
+        append_decision = (
+            n_features < self.APPEND_TO_ORIGINAL_THRESHOLD
+            and n_features <= (max_features_per_estimator / 2)
+        )
+        return bool(
+            append_decision
+            if self.append_to_original == "auto"
+            else self.append_to_original
+        )
+
+    @override
+    def num_added_features(
+        self,
+        n_samples: int,
+        feature_schema: FeatureSchema,
+    ) -> int:
+        """Return the number of added features."""
+        del n_samples
+        n_features = feature_schema.num_columns
+        append = self._get_append_to_original_decision(
+            n_features=n_features,
+            max_features_per_estimator=self.max_features_per_estimator,
+        )
+        if append:
+            if self.apply_to_categorical:
+                return n_features
+            return len(feature_schema.indices_for(FeatureModality.NUMERICAL))
+        return 0
 
 
 def get_adaptive_preprocessors(
@@ -400,32 +506,40 @@ def get_all_reshape_feature_distribution_preprocessors(
         ),
         "quantile_uni_coarse": AdaptiveQuantileTransformer(
             output_distribution="uniform",
-            n_quantiles=max(num_examples // 10, 2),
+            n_quantiles=get_user_n_quantiles_for_preset(
+                "quantile_uni_coarse", num_examples
+            ),
             random_state=random_state,
         ),
         "quantile_norm_coarse": AdaptiveQuantileTransformer(
             output_distribution="normal",
-            n_quantiles=max(num_examples // 10, 2),
+            n_quantiles=get_user_n_quantiles_for_preset(
+                "quantile_norm_coarse", num_examples
+            ),
             random_state=random_state,
         ),
         "quantile_uni": AdaptiveQuantileTransformer(
             output_distribution="uniform",
-            n_quantiles=max(num_examples // 5, 2),
+            n_quantiles=get_user_n_quantiles_for_preset("quantile_uni", num_examples),
             random_state=random_state,
         ),
         "quantile_norm": AdaptiveQuantileTransformer(
             output_distribution="normal",
-            n_quantiles=max(num_examples // 5, 2),
+            n_quantiles=get_user_n_quantiles_for_preset("quantile_norm", num_examples),
             random_state=random_state,
         ),
         "quantile_uni_fine": AdaptiveQuantileTransformer(
             output_distribution="uniform",
-            n_quantiles=num_examples,
+            n_quantiles=get_user_n_quantiles_for_preset(
+                "quantile_uni_fine", num_examples
+            ),
             random_state=random_state,
         ),
         "quantile_norm_fine": AdaptiveQuantileTransformer(
             output_distribution="normal",
-            n_quantiles=num_examples,
+            n_quantiles=get_user_n_quantiles_for_preset(
+                "quantile_norm_fine", num_examples
+            ),
             random_state=random_state,
         ),
         "squashing_scaler_default": SquashingScaler(),

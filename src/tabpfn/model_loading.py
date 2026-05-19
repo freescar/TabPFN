@@ -1,10 +1,11 @@
 """Functions for downloading and loading model checkpoints."""
 
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import inspect
 import json
@@ -54,6 +55,7 @@ FALLBACK_S3_BASE_URL = "https://storage.googleapis.com/tabpfn-v2-model-files/051
 # Special string used to identify model paths.
 V_2_5_IDENTIFIER = "v2.5"
 V_2_6_IDENTIFIER = "v2.6"
+V_3_IDENTIFIER = "v3"
 
 
 class ModelType(str, Enum):  # noqa: D101
@@ -164,8 +166,34 @@ class ModelSource:  # noqa: D101
             filenames=filenames,
         )
 
+    @classmethod
+    def get_classifier_v3(cls) -> ModelSource:  # noqa: D102
+        filenames = [
+            "tabpfn-v3-classifier-v3_default.ckpt",
+            "tabpfn-v3-classifier-v3_20260417_binary.ckpt",
+            "tabpfn-v3-classifier-v3_20260417_multiclass.ckpt",
+        ]
+        return cls(
+            repo_id="Prior-Labs/tabpfn_3",
+            default_filename="tabpfn-v3-classifier-v3_default.ckpt",
+            filenames=filenames,
+        )
 
-def _get_model_source(version: ModelVersion, model_type: ModelType) -> ModelSource:
+    @classmethod
+    def get_regressor_v3(cls) -> ModelSource:  # noqa: D102
+        filenames = [
+            "tabpfn-v3-regressor-v3_default.ckpt",
+            "tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt",
+            "tabpfn-v3-regressor-v3_20260506_timeseries.ckpt",
+        ]
+        return cls(
+            repo_id="Prior-Labs/tabpfn_3",
+            default_filename="tabpfn-v3-regressor-v3_default.ckpt",
+            filenames=filenames,
+        )
+
+
+def _get_model_source(version: ModelVersion, model_type: ModelType) -> ModelSource:  # noqa: PLR0911
     if version == ModelVersion.V2:
         if model_type == ModelType.CLASSIFIER:
             return ModelSource.get_classifier_v2()
@@ -181,6 +209,11 @@ def _get_model_source(version: ModelVersion, model_type: ModelType) -> ModelSour
             return ModelSource.get_classifier_v2_6()
         if model_type == ModelType.REGRESSOR:
             return ModelSource.get_regressor_v2_6()
+    elif version == ModelVersion.V3:
+        if model_type == ModelType.CLASSIFIER:
+            return ModelSource.get_classifier_v3()
+        if model_type == ModelType.REGRESSOR:
+            return ModelSource.get_regressor_v3()
 
     raise ValueError(
         f"Unsupported version/model combination: {version.value}/{model_type.value}",
@@ -345,6 +378,8 @@ def download_all_models(to: Path) -> None:
         (ModelVersion.V2_5, ModelSource.get_regressor_v2_5(), "regressor"),
         (ModelVersion.V2_6, ModelSource.get_classifier_v2_6(), "classifier"),
         (ModelVersion.V2_6, ModelSource.get_regressor_v2_6(), "regressor"),
+        (ModelVersion.V3, ModelSource.get_classifier_v3(), "classifier"),
+        (ModelVersion.V3, ModelSource.get_regressor_v3(), "regressor"),
     ]:
         for ckpt_name in model_source.filenames:
             path = to / ckpt_name
@@ -353,17 +388,19 @@ def download_all_models(to: Path) -> None:
                     f"Skipping download of checkpoint that already exists: {path}"
                 )
                 continue
-            download_model(
+            result = download_model(
                 to=path,
                 version=model_version,
                 which=cast("Literal['classifier', 'regressor']", model_type),
                 model_name=ckpt_name,
             )
+            if result != "ok":
+                logger.warning(f"Errors downloading model {model_version}: {result}")
 
 
 def _version_has_direct_download_option(version: ModelVersion) -> bool:
     """Determine if a version has a direct download option."""
-    return version in (ModelVersion.V2, ModelVersion.V2_5)
+    return version in (ModelVersion.V2,)
 
 
 def get_cache_dir() -> Path:  # noqa: PLR0911
@@ -464,6 +501,7 @@ def _download_model(
     _HF_REPOS = {
         ModelVersion.V2_5: "tabpfn_2_5",
         ModelVersion.V2_6: "tabpfn_2_6",
+        ModelVersion.V3: "tabpfn_3",
     }
     if version in _HF_REPOS:
         try:
@@ -536,7 +574,7 @@ def load_model_criterion_config(
     *,
     check_bar_distribution_criterion: Literal[False],
     cache_trainset_representation: bool,
-    version: Literal["v2", "v2.5", "v2.6"],
+    version: Literal["v2", "v2.5", "v2.6", "v3"],
     which: Literal["classifier"],
     download_if_not_exists: bool,
 ) -> tuple[
@@ -553,7 +591,7 @@ def load_model_criterion_config(
     *,
     check_bar_distribution_criterion: Literal[True],
     cache_trainset_representation: bool,
-    version: Literal["v2", "v2.5", "v2.6"],
+    version: Literal["v2", "v2.5", "v2.6", "v3"],
     which: Literal["regressor"],
     download_if_not_exists: bool,
 ) -> tuple[
@@ -570,7 +608,7 @@ def load_model_criterion_config(  # noqa: PLR0912
     check_bar_distribution_criterion: bool,
     cache_trainset_representation: bool,
     which: Literal["regressor", "classifier"],
-    version: Literal["v2", "v2.5", "v2.6"] = "v2.6",
+    version: Literal["v2", "v2.5", "v2.6", "v3"],
     download_if_not_exists: bool,
 ) -> tuple[
     list[Architecture],
@@ -777,10 +815,13 @@ def log_model_init_params(
 def _resolve_model_version(model_path: ModelPath | None) -> ModelVersion:
     if model_path is None:
         return settings.tabpfn.model_version
-    if V_2_6_IDENTIFIER in Path(model_path).name:
+    name = Path(model_path).name
+    if V_2_6_IDENTIFIER in name:
         return ModelVersion.V2_6
-    if V_2_5_IDENTIFIER in Path(model_path).name:
+    if V_2_5_IDENTIFIER in name:
         return ModelVersion.V2_5
+    if V_3_IDENTIFIER in name:
+        return ModelVersion.V3
     return ModelVersion.V2
 
 
@@ -801,7 +842,7 @@ def resolve_model_version(
 def resolve_model_path(
     model_path: ModelPath | list[ModelPath] | None,
     which: Literal["regressor", "classifier"],
-    version: Literal["v2", "v2.5", "v2.6"] = "v2.6",
+    version: Literal["v2", "v2.5", "v2.6", "v3"] = "v3",
 ) -> tuple[
     list[Path],
     list[Path],
@@ -814,6 +855,11 @@ def resolve_model_path(
         model_path: An optional path to a model file. If None, the default
             model for the given `which` and `version` will be used, resolving
             to the local cache directory.
+
+            When a bare filename is given (no directory component, e.g.
+            ``"tabpfn-v3-regressor-v3_default.ckpt"``), the path is first
+            interpreted relative to the current working directory. If no file
+            exists there, it falls back to the TabPFN cache directory.
         which: The type of model ('regressor' or 'classifier').
         version: The model version (currently only 'v2').
 
@@ -830,9 +876,14 @@ def resolve_model_path(
         resolved_model_dirs = [get_cache_dir()]
         resolved_model_paths = [resolved_model_dirs[0] / resolved_model_names[0]]
     elif isinstance(model_path, (str, Path)):
-        resolved_model_paths = [Path(model_path)]
-        resolved_model_dirs = [resolved_model_paths[0].parent]
-        resolved_model_names = [resolved_model_paths[0].name]
+        path = Path(model_path)
+        # A bare filename is checked against the CWD first, otherwise the cache dir as a
+        # fallback so callers can refer to a checkpoint by name alone.
+        if not path.is_absolute() and path.parent == Path() and not path.exists():
+            path = get_cache_dir() / path
+        resolved_model_paths = [path]
+        resolved_model_dirs = [path.parent]
+        resolved_model_names = [path.name]
     else:
         resolved_model_paths = [Path(p) for p in model_path]
         resolved_model_dirs = [p.parent for p in resolved_model_paths]
@@ -868,13 +919,25 @@ def get_loss_criterion(
     return FullSupportBarDistribution(borders, ignore_nan_targets=True)
 
 
-@functools.cache
-def _load_checkpoint(path: str) -> dict:
+def _file_identity(path: str) -> tuple[int, int]:
+    """Return a cheap identity tuple (mtime_ns, size) for cache-keying."""
+    st = Path(path).stat()
+    return (st.st_mtime_ns, st.st_size)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_checkpoint_cached(path: str, _identity: tuple[int, int]) -> dict:
     """Load and cache a checkpoint from disk.
 
-    Cached so that repeated ``load_model`` calls with the same path skip disk
-    I/O.  Use ``_load_checkpoint.cache_clear()`` to free memory.
+    The ``_identity`` key ensures the cache is invalidated when the file at
+    *path* is modified.  Use ``_load_checkpoint_cached.cache_clear()`` to
+    free memory manually.
     """
+    return _load_checkpoint(path)
+
+
+def _load_checkpoint(path: str) -> dict:
+    """Load a checkpoint from disk."""
     # Catch the `FutureWarning` that torch raises. This should be dealt with!
     # The warning is raised due to `torch.load`, which advises against ckpt
     # files that contain non-tensor data.
@@ -897,16 +960,17 @@ def load_model(
 ]:
     """Loads a model from a given path. Only for inference.
 
-    The raw checkpoint is cached so that repeated calls with the same path
-    skip disk I/O.  Each call returns a fresh model instance so callers can
-    mutate it freely (finetuning, differentiable input, KV caching, etc.).
+    The raw checkpoint is cached in memory so that repeated calls with the
+    same path skip disk I/O.  The cache is automatically invalidated when
+    the file is modified (detected via mtime and size).
 
     Args:
         path: Path to the checkpoint
         cache_trainset_representation: If True, the model will cache the
             trainset representation. Forwarded to get_architecture.
     """
-    checkpoint = _load_checkpoint(str(path.resolve()))
+    resolved = str(path.resolve())
+    checkpoint = _load_checkpoint_cached(resolved, _file_identity(resolved))
 
     try:
         architecture_name = checkpoint["architecture_name"]
@@ -925,12 +989,14 @@ def load_model(
     )
 
     if "test_targets_MB" in inspect.signature(model.forward).parameters:
-        # The model computes the loss internally. Support for this was only added after
-        # v2.5, so we can safely assume that the inference config is stored in the
-        # checkpoint.
-        model.load_state_dict(full_state)
+        # The model computes the loss internally. Strip criterion keys that
+        # save_tabpfn_model may have written so load_state_dict doesn't reject them.
+        model_state = {k: v for k, v in full_state.items() if "criterion." not in k}
+        model.load_state_dict(model_state)
         model.eval()
-        inference_config = InferenceConfig(**(checkpoint["inference_config"]))
+        inference_config = InferenceConfig(
+            **_rename_old_inference_config_keys(checkpoint["inference_config"])
+        )
         empty_criterion = None
         return model, empty_criterion, model_config, inference_config
 
@@ -966,7 +1032,7 @@ def _get_inference_config_from_checkpoint(
     #   v2.5: "architecture_name" present, but "inference_config" not present
     #  >v2.5: "inference_config" present, so don't need to guess a default config
     if inference_config := checkpoint.get("inference_config"):
-        return InferenceConfig(**inference_config)
+        return InferenceConfig(**_rename_old_inference_config_keys(inference_config))
 
     if "architecture_name" not in checkpoint:
         model_version = ModelVersion.V2
@@ -979,6 +1045,16 @@ def _get_inference_config_from_checkpoint(
         task_type = "multiclass"
 
     return InferenceConfig.get_default(task_type, model_version)
+
+
+def _rename_old_inference_config_keys(inference_config: dict) -> dict:
+    """Rename keys in the inference config to the new names."""
+    inference_config = copy.deepcopy(inference_config)
+    if "CONSTANT_FEATURE_COUNT" in inference_config:
+        inference_config["FEATURE_SUBSAMPLING_CONSTANT_FEATURE_COUNT"] = (
+            inference_config.pop("CONSTANT_FEATURE_COUNT")
+        )
+    return inference_config
 
 
 def save_tabpfn_model(
@@ -1017,6 +1093,7 @@ def save_tabpfn_model(
         znorm_space_bardist = model.znorm_space_bardist_  # type: ignore
 
     configs = model.configs_
+    inference_config = getattr(model, "inference_config_", None)
     save_paths = save_path if isinstance(save_path, list) else [save_path]
 
     for ens_model, config, path in zip(
@@ -1039,7 +1116,10 @@ def save_tabpfn_model(
             "state_dict": state_dict,
             "config": asdict(config),
             "architecture_name": architecture_name,
+            "inference_config": asdict(model.inference_config_),
         }
+        if inference_config is not None:
+            checkpoint["inference_config"] = asdict(inference_config)
 
         if additional_fields is not None:
             checkpoint.update(additional_fields)
@@ -1162,11 +1242,14 @@ def load_fitted_tabpfn_model(
 
 def _resolve_architecture_name(config: ArchitectureConfig) -> str:
     """Resolve the architecture name from the config."""
-    name = getattr(config, "name", None)
-    if name is None:
-        return "base"
-    if "2.6" in name:
+    from tabpfn.architectures.tabpfn_v2_5 import TabPFNV2p5Config  # noqa: PLC0415
+    from tabpfn.architectures.tabpfn_v2_6 import TabPFNV2p6Config  # noqa: PLC0415
+    from tabpfn.architectures.tabpfn_v3 import TabPFNV3Config  # noqa: PLC0415
+
+    if isinstance(config, TabPFNV3Config):
+        return "tabpfn_v3"
+    if isinstance(config, TabPFNV2p6Config):
         return "tabpfn_v2_6"
-    if "2.5" in name:
+    if isinstance(config, TabPFNV2p5Config):
         return "tabpfn_v2_5"
     return "base"

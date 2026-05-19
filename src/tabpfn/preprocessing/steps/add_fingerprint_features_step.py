@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Add Fingerprint Features Step."""
 
 from __future__ import annotations
@@ -141,6 +143,12 @@ class AddFingerprintFeaturesStep(PreprocessingStep):
             added_fingerprint = X_h.reshape(-1, 1)
 
         return X, added_fingerprint, FeatureModality.NUMERICAL
+
+    @override
+    def num_added_features(self, n_samples: int, feature_schema: FeatureSchema) -> int:
+        """Return the number of added features."""
+        del n_samples, feature_schema
+        return 1
 
 
 __all__ = [

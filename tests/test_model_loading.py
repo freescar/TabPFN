@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 from __future__ import annotations
 
 import threading
@@ -5,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, overload
 from typing_extensions import override
 from unittest.mock import patch
@@ -15,7 +18,8 @@ from pydantic.dataclasses import dataclass
 from torch import Tensor
 
 from tabpfn import model_loading
-from tabpfn.architectures import ARCHITECTURES, base
+from tabpfn.architectures import ARCHITECTURES, base, tabpfn_v3
+from tabpfn.architectures.base.bar_distribution import FullSupportBarDistribution
 from tabpfn.architectures.base.config import ModelConfig
 from tabpfn.architectures.base.transformer import PerFeatureTransformer
 from tabpfn.architectures.interface import (
@@ -23,6 +27,8 @@ from tabpfn.architectures.interface import (
     ArchitectureConfig,
     ArchitectureModule,
 )
+from tabpfn.architectures.tabpfn_v3 import TabPFNV3Config
+from tabpfn.constants import ModelVersion
 from tabpfn.inference_config import InferenceConfig
 from tabpfn.preprocessing import PreprocessorConfig
 
@@ -113,6 +119,11 @@ class DummyArchitecture(Architecture):
     ) -> Tensor | dict[str, Tensor]:
         raise NotImplementedError()
 
+    @property
+    @override
+    def embedding_dim(self) -> int:
+        raise NotImplementedError()
+
 
 @patch.dict(ARCHITECTURES, fake_arch=FakeArchitectureModule())
 def test__load_model__architecture_name_in_checkpoint__loads_specified_architecture(
@@ -133,6 +144,26 @@ def test__load_model__architecture_name_in_checkpoint__loads_specified_architect
     loaded_model, _, loaded_config, _ = model_loading.load_model(path=checkpoint_path)
     assert isinstance(loaded_model, DummyArchitecture)
     assert isinstance(loaded_config, FakeConfig)
+
+
+def test__save_tabpfn_model__stores_v3_architecture_and_inference_config(
+    tmp_path: Path,
+) -> None:
+    config = TabPFNV3Config(max_num_classes=10, num_buckets=100)
+    inference_config = InferenceConfig.get_default("multiclass", ModelVersion.V2_5)
+    estimator = SimpleNamespace(
+        models_=[torch.nn.Linear(1, 1)],
+        configs_=[config],
+        inference_config_=inference_config,
+    )
+    checkpoint_path = tmp_path / "checkpoint.ckpt"
+
+    model_loading.save_tabpfn_model(estimator, checkpoint_path)
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["architecture_name"] == "tabpfn_v3"
+    assert checkpoint["config"]["name"] == "TabPFN-v3"
+    assert checkpoint["inference_config"] == asdict(inference_config)
 
 
 def test__load_v2_checkpoint__returns_v2_preprocessings(
@@ -257,6 +288,89 @@ def test__load_v2_5_regression_ckpt__returns_v2_5_preprocessing(
         inference_config.PREPROCESS_TRANSFORMS[1].categorical_name
         == "ordinal_very_common_categories_shuffled"
     )
+
+
+def _build_small_v3_checkpoint(
+    inference_config: InferenceConfig, *, max_num_classes: int
+) -> dict:
+    # v3 checkpoints store the inference_config directly; loading must round-trip
+    # it without falling back to a version-specific default.
+    config = TabPFNV3Config(
+        max_num_classes=max_num_classes,
+        num_buckets=5,
+        embed_dim=48,
+        nlayers=1,
+        icl_num_heads=3,
+        dist_embed_num_heads=3,
+        feat_agg_num_heads=3,
+    )
+    model = tabpfn_v3.get_architecture(config, cache_trainset_representation=False)
+    return {
+        "state_dict": model.state_dict(),
+        "config": asdict(config),
+        "architecture_name": "tabpfn_v3",
+        "inference_config": asdict(inference_config),
+    }
+
+
+def test__load_v3_classification_ckpt__returns_inference_config_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    inference_config = InferenceConfig(
+        PREPROCESS_TRANSFORMS=[
+            PreprocessorConfig(
+                "squashing_scaler_default",
+                append_original=False,
+                categorical_name="ordinal_very_common_categories_shuffled",
+                global_transformer_name="svd_quarter_components",
+                max_features_per_estimator=500,
+            ),
+        ]
+    )
+    checkpoint = _build_small_v3_checkpoint(inference_config, max_num_classes=10)
+    checkpoint_path = tmp_path / "checkpoint.ckpt"
+    torch.save(checkpoint, checkpoint_path)
+
+    _, _, _, loaded_inference_config = model_loading.load_model_criterion_config(
+        model_path=[checkpoint_path, checkpoint_path],
+        check_bar_distribution_criterion=False,
+        cache_trainset_representation=False,
+        which="classifier",
+        version="v3",
+        download_if_not_exists=False,
+    )
+
+    assert loaded_inference_config == inference_config
+
+
+def test__load_v3_regression_ckpt__returns_bar_distribution_from_model_borders(
+    tmp_path: Path,
+) -> None:
+    # v3 stores the loss criterion inside the model and returns no external
+    # criterion from load_model. The regression path wraps the model's
+    # `regression_borders` buffer into a FullSupportBarDistribution.
+    inference_config = InferenceConfig(
+        PREPROCESS_TRANSFORMS=[
+            PreprocessorConfig("quantile_uni_coarse"),
+        ]
+    )
+    checkpoint = _build_small_v3_checkpoint(inference_config, max_num_classes=0)
+    checkpoint_path = tmp_path / "checkpoint.ckpt"
+    torch.save(checkpoint, checkpoint_path)
+
+    _, criterion, _, loaded_inference_config = (
+        model_loading.load_model_criterion_config(
+            model_path=[checkpoint_path],
+            check_bar_distribution_criterion=True,
+            cache_trainset_representation=False,
+            which="regressor",
+            version="v3",
+            download_if_not_exists=False,
+        )
+    )
+
+    assert isinstance(criterion, FullSupportBarDistribution)
+    assert loaded_inference_config == inference_config
 
 
 @patch.dict(ARCHITECTURES, fake_arch=FakeArchitectureModule())

@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Abstract base class for fine-tuning TabPFN models.
 
 This module provides the FinetunedTabPFNBase class, which contains shared
@@ -31,6 +33,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
+from tabpfn.architectures.interface import PerformanceOptions
 from tabpfn.finetuning._torch_compat import GradScaler, autocast, sdpa_kernel_context
 from tabpfn.finetuning.data_util import (
     ClassifierBatch,
@@ -38,6 +41,7 @@ from tabpfn.finetuning.data_util import (
     get_preprocessed_dataset_chunks,
     meta_dataset_collator,
 )
+from tabpfn.finetuning.logging import FinetuningLogger, NullLogger
 from tabpfn.finetuning.train_util import (
     get_and_init_optimizer,
     get_checkpoint_path_and_epoch_from_output_dir,
@@ -238,6 +242,9 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             data batches. This is helpful in most cases because, e.g., the column order
             will stay the same across batches.
             If False, the preprocessing will use a different random seed for each batch.
+        experiment_logger: An optional logger implementing the ``FinetuningLogger``
+            protocol (e.g., ``WandbLogger``) for experiment tracking. If None,
+            a no-op ``NullLogger`` is used. Defaults to None.
     """
 
     def __init__(  # noqa: PLR0913
@@ -265,8 +272,10 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         use_activation_checkpointing: bool = True,
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
+        experiment_logger: FinetuningLogger | None = None,
     ):
         super().__init__()
+        self.experiment_logger = experiment_logger
         self.device = device
         self.epochs = epochs
         self.time_limit = time_limit
@@ -314,6 +323,9 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
     ) -> dict[str, Any]:
         """Return a deep-copy of base_config with an optional n_estimators override."""
         config = copy.deepcopy(base_config)
+        existing_inference_config = dict(config.get("inference_config", {}) or {})
+        existing_inference_config["ENABLE_GPU_PREPROCESSING"] = False
+        config["inference_config"] = existing_inference_config
         if n_estimators_override is not None:
             config["n_estimators"] = n_estimators_override
         return config
@@ -325,9 +337,9 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
     ) -> dict[str, Any]:
         """Return eval config with n_estimators override and subsample setting."""
         config = self._build_estimator_config(base_config, n_estimators_override)
-        existing = dict(config.get("inference_config", {}) or {})
-        existing["SUBSAMPLE_SAMPLES"] = self.n_inference_subsample_samples
-        config["inference_config"] = existing
+        config["inference_config"]["SUBSAMPLE_SAMPLES"] = (
+            self.n_inference_subsample_samples
+        )
         return config
 
     def _training_forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -549,6 +561,22 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         if using_ddp:
             self.device = device_str
 
+        _logger = self.experiment_logger or NullLogger()
+        global_step = 0
+
+        if is_main_process:
+            config = {
+                k: v for k, v in self.get_params().items() if k != "experiment_logger"
+            }
+            try:
+                _logger.setup(config)
+            except (OSError, ModuleNotFoundError):
+                logger.warning(
+                    "Experiment logger setup failed, falling back to NullLogger.",
+                    exc_info=True,
+                )
+                _logger = NullLogger()
+
         # Store the original training size for checkpoint naming
         train_size = X.shape[0]
         start_time = time.monotonic()
@@ -612,15 +640,18 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self.finetuned_estimator_ = self._create_estimator(finetuning_estimator_config)
         self._setup_estimator()
 
-        X, y, _, _ = ensure_compatible_fit_inputs_sklearn(
-            X,
-            y,
-            estimator=self.finetuned_estimator_,
-            ensure_y_numeric=self._model_type == "regressor",
+        X_validated, y_validated, self.feature_names_in_, self.n_features_in_ = (
+            ensure_compatible_fit_inputs_sklearn(
+                X,
+                y,
+                estimator=self.finetuned_estimator_,
+                ensure_y_numeric=self._model_type == "regressor",
+            )
         )
-
         self.X_ = X
         self.y_ = y
+        X, y = X_validated, y_validated
+
         if X_val is not None and y_val is not None:
             X_train, y_train = X, y
             X_val, y_val, _, _ = ensure_compatible_fit_inputs_sklearn(
@@ -641,8 +672,10 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self.finetuned_estimator_._initialize_model_variables()
         self.finetuned_estimator_.model_.to(self.device)
 
-        if self.use_activation_checkpointing:
-            self.finetuned_estimator_.model_.recompute_layer = True  # type: ignore
+        finetuning_performance_options = PerformanceOptions(
+            force_recompute_layer=self.use_activation_checkpointing,
+            use_chunkwise_inference=False,
+        )
 
         # --- DDP model wrapping ---
         model_for_optimization = self.finetuned_estimator_.model_
@@ -826,6 +859,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                     batch.y_context,
                     batch.cat_indices,
                     batch.configs,
+                    performance_options=finetuning_performance_options,
                 )
 
                 if using_ddp:
@@ -870,6 +904,23 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
 
                 epoch_loss_sum += loss_scalar
                 epoch_batches += 1
+                global_step += 1
+
+                if is_main_process:
+                    current_lr = (
+                        scheduler.get_last_lr()[0]
+                        if scheduler is not None
+                        else self.learning_rate
+                    )
+                    _logger.log_step(
+                        {
+                            "train/loss": loss_scalar,
+                            "train/lr": current_lr,
+                            "train/epoch": epoch,
+                            "train/global_step": global_step,
+                        },
+                        step=global_step,
+                    )
 
                 progress_bar.set_postfix(
                     loss=f"{loss_scalar:.4f}",
@@ -900,6 +951,17 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                     y_val,  # pyright: ignore[reportArgumentType]
                 )
                 self._log_epoch_evaluation(epoch, eval_result, mean_train_loss)
+
+                epoch_log_metrics: dict[str, float] = {
+                    "train/epoch": epoch,
+                    f"val/{self._metric_name}": eval_result.primary,
+                }
+                if mean_train_loss is not None:
+                    epoch_log_metrics["train/mean_loss"] = mean_train_loss
+                for k, v in eval_result.secondary.items():
+                    epoch_log_metrics[f"val/{k}"] = v
+                _logger.log_epoch(epoch_log_metrics, step=global_step)
+
                 primary_metric = eval_result.primary
             else:
                 primary_metric = self._get_initial_best_metric()
@@ -992,6 +1054,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 dist.destroy_process_group()
 
         if is_main_process:
+            _logger.finish()
             logger.info("--- ✅ Fine-tuning Finished ---")
 
         if is_main_process:

@@ -1,16 +1,28 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Preprocessor and ensemble config objects."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Literal
 from typing_extensions import override
 
 if TYPE_CHECKING:
     import numpy as np
-    import numpy.typing as npt
     from sklearn.base import TransformerMixin
     from sklearn.pipeline import Pipeline
+
+
+class FeatureSubsamplingMethod(str, Enum):
+    """Method for subsampling features if dataset exceeds max_features_per_estimator."""
+
+    BALANCED = "balanced"
+    RANDOM = "random"
+    CONSTANT_AND_BALANCED = "constant_and_balanced"
+    GINI_FEATURE_IMPORTANCE = "gini_feature_importance"
+    AUTO = "auto"
 
 
 @dataclass(frozen=True, eq=True)
@@ -137,8 +149,6 @@ class EnsembleConfig:
         polynomial_features: Maximum number of polynomial features to add, if any.
         feature_shift_count: How much to shift the features columns.
         feature_shift_decoder: How to shift features.
-        subsample_ix: Indices of samples to use for this ensemble member.
-            If `None`, no subsampling is done.
         outlier_removal_std: Number of standard deviations from the mean to consider a
             sample an outlier. If `None`, no outliers are removed.
     """
@@ -148,7 +158,6 @@ class EnsembleConfig:
     polynomial_features: Literal["no", "all"] | int
     feature_shift_count: int
     feature_shift_decoder: Literal["shuffle", "rotate"] | None
-    subsample_ix: npt.NDArray[np.int64] | None  # OPTIM: Could use uintp
     outlier_removal_std: float | None
     # Internal index specifying which model to use for this ensemble member.
     _model_index: int
@@ -171,6 +180,7 @@ class RegressorEnsembleConfig(EnsembleConfig):
 __all__ = [
     "ClassifierEnsembleConfig",
     "EnsembleConfig",
+    "FeatureSubsamplingMethod",
     "PreprocessorConfig",
     "RegressorEnsembleConfig",
 ]

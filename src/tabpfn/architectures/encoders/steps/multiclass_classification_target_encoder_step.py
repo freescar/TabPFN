@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Encoder step to encode multiclass classification targets."""
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from typing_extensions import override
 import torch
 
 from tabpfn.architectures.encoders import TorchPreprocessingStep
+from tabpfn.architectures.shared.compile_utils import lazy_compiler_disable
 
 
 class MulticlassClassificationTargetEncoderStep(TorchPreprocessingStep):
@@ -35,7 +38,7 @@ class MulticlassClassificationTargetEncoderStep(TorchPreprocessingStep):
         return self
 
     # torch.unique breaks the graph, so we disable compilation for this method.
-    @torch.compiler.disable
+    @lazy_compiler_disable
     @override
     def _fit(
         self,
@@ -67,7 +70,7 @@ class MulticlassClassificationTargetEncoderStep(TorchPreprocessingStep):
 
     # data-dependent control flow in .any() breaks the graph, so we disable compilation
     # for this method.
-    @torch.compiler.disable
+    @lazy_compiler_disable
     @override
     def _transform(
         self,

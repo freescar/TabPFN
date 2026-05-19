@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Tests for TabPFN classifier finetuning functionality.
 
 This module contains tests for:
@@ -26,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from tabpfn import TabPFNClassifier
 from tabpfn.architectures.base.transformer import PerFeatureTransformer
+from tabpfn.architectures.interface import PerformanceOptions
 from tabpfn.finetuning.data_util import (
     ClassifierBatch,
     DatasetCollectionWithPreprocessing,
@@ -968,7 +971,11 @@ def test__tabpfn_classifier__fit_from_preprocessed_runs(
         assert isinstance(batch, ClassifierBatch)
         cat_indices = cast(list[list[list[int]]], batch.cat_indices)
         clf.fit_from_preprocessed(
-            batch.X_context, batch.y_context, cat_indices, batch.configs
+            batch.X_context,
+            batch.y_context,
+            cat_indices,
+            batch.configs,
+            performance_options=PerformanceOptions(),
         )
         preds = clf.forward(batch.X_query)
         assert preds.ndim == 3, f"Expected 3D output, got {preds.shape}"
@@ -1022,6 +1029,7 @@ def test__tabpfn_classifier__preprocessing_consistency_fit_vs_fit_from_prep() ->
         device="auto",
         random_state=common_seed,
         fit_mode="fit_preprocessors",  # A standard mode that preprocesses on fit
+        inference_config={"ENABLE_GPU_PREPROCESSING": False},
     )
     # 'batched' mode is required for get_preprocessed_datasets
     #  and fit_from_preprocessed
@@ -1099,7 +1107,11 @@ def test__tabpfn_classifier__preprocessing_consistency_fit_vs_fit_from_prep() ->
 
     cat_indices = cast(list[list[list[int]]], batch.cat_indices)
     clf_batched.fit_from_preprocessed(
-        batch.X_context, batch.y_context, cat_indices, batch.configs
+        batch.X_context,
+        batch.y_context,
+        cat_indices,
+        batch.configs,
+        performance_options=PerformanceOptions(),
     )
     assert hasattr(clf_batched, "models_"), (
         "Batched classifier models_ not found after fit_from_preprocessed."

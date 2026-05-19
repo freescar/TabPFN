@@ -1,4 +1,4 @@
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ class ModelConfig(ArchitectureConfig):
     nan_handling_enabled: Literal[True] = True
     nan_handling_y_encoder: Literal[True] = True
     nhid_factor: int = 4
-    """Hidden dimension in the MLP layers is ninp * nhid_factor."""
+    """Hidden dimension in the MLP layers is emsize * nhid_factor."""
     nlayers: int = 12
     """Number of layers in the encoder, each consisting of
     a multi-head attention and an MLP layer."""
@@ -69,7 +69,8 @@ class ModelConfig(ArchitectureConfig):
     """If True, enables activation checkpointing for each PerFeatureEncoderLayer in the
     encoder. This saves memory. recompute_attn is a related flag which checkpoints the
     attention and mlp layers individually. Note that the forward pass takes an argument
-    `force_recompute_layer` which can be used to force recomputation of the layer."""
+    `PerformanceOptions.force_recompute_layer` which can be used to force recomputation
+    of the layer."""
     remove_empty_features: Literal[True] = True
     remove_outliers: Literal[False] = False
     use_separate_decoder: Literal[False] = False

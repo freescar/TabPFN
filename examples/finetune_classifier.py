@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Example of fine-tuning a TabPFN classifier using the FinetunedTabPFNClassifier wrapper.
 
 Note: We recommend running the fine-tuning script on a CUDA-enabled GPU with 80 GB of VRAM.
@@ -115,6 +117,9 @@ def main() -> None:
         print("--- 2. Initializing and Fitting Model ---\n")
 
     # Instantiate the wrapper with your desired hyperparameters
+    # To enable WandB logging, pass an experiment_logger:
+    # .  from tabpfn.finetuning.logging import WandbLogger
+    #   experiment_logger=WandbLogger(project="my-project", run_name="my-run", entity="my-entity")
     finetuned_clf = FinetunedTabPFNClassifier(
         device="cuda",
         epochs=NUM_EPOCHS,

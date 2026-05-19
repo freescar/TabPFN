@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Contains a collection of different model architectures.
 
 "Architecture" refers to a PyTorch module, which is then wrapped by e.g.
@@ -11,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from . import base, tabpfn_v2_5, tabpfn_v2_6
+from . import base, tabpfn_v2_5, tabpfn_v2_6, tabpfn_v3
 
 if TYPE_CHECKING:
     from tabpfn.architectures.interface import ArchitectureModule
@@ -20,6 +22,7 @@ ARCHITECTURES: dict[str, ArchitectureModule] = {
     "base": base,
     "tabpfn_v2_5": tabpfn_v2_5,
     "tabpfn_v2_6": tabpfn_v2_6,
+    "tabpfn_v3": tabpfn_v3,
 }
 """Map from architecture names to the corresponding module."""
 

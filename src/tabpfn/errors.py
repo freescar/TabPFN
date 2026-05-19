@@ -1,6 +1,6 @@
 """Custom exception classes for TabPFN."""
 
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
+
+from tabpfn.settings import settings
 
 if TYPE_CHECKING:
     from tabpfn.constants import XType
@@ -31,12 +33,22 @@ class TabPFNLicenseError(TabPFNError):
 
     def __init__(self, message: str | None = None):
         if message is None:
+            gui_url = settings.tabpfn.auth_gui_url
             message = (
-                "TabPFN requires license acceptance before downloading.\n\n"
-                "To accept the license, run your script in an interactive terminal\n"
-                "so a browser window can open for login, or set the TABPFN_TOKEN\n"
-                "environment variable with a valid token obtained from\n"
-                "https://ux.priorlabs.ai"
+                "TabPFN requires a one-time license acceptance"
+                " to download model weights for local"
+                " inference.\n\n"
+                "To authenticate in a non-interactive"
+                " environment:\n"
+                f"  1. Open {gui_url} in a browser"
+                " and log in (or register)\n"
+                "  2. Accept the license on the Licenses tab\n"
+                "  3. Copy your API Key from"
+                f" {gui_url}/account\n"
+                "  4. Set the environment variable:"
+                ' export TABPFN_TOKEN="<your-api-key>"\n'
+                "     or in Python (before calling .fit()):"
+                ' import os; os.environ["TABPFN_TOKEN"] = "<your-api-key>"'
             )
         super().__init__(message)
 
@@ -105,10 +117,8 @@ class TabPFNOutOfMemoryError(TabPFNError):
             f"        predictions.append(pred)\n"
             f"    predictions = np.vstack(predictions)\n\n"
             f"2) Large training set — batching won't help.\n"
-            f"   You need subsampling or ensembling, see:\n"
-            f"   https://github.com/PriorLabs/tabpfn-extensions/"
-            f"blob/main/examples/large_datasets/"
-            f"large_datasets_example.py\n\n"
+            f"   Subsample your training data; see https://docs.priorlabs.ai\n"
+            f"   for further guidance.\n\n"
             f"{size_line}"
             f"Not sure which? If model.{predict_method}(X_test[:1]) "
             f"also fails, it's (2)."
@@ -129,6 +139,13 @@ class TabPFNMPSOutOfMemoryError(TabPFNOutOfMemoryError):
     """Error raised when MPS (Apple Silicon) runs out of memory during prediction."""
 
     device_name = "MPS"
+
+
+def is_oom_error(e: Exception) -> bool:
+    """Return True if *e* is a GPU out-of-memory error (CUDA or MPS)."""
+    return isinstance(e, torch.OutOfMemoryError) or (
+        isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+    )
 
 
 @contextmanager

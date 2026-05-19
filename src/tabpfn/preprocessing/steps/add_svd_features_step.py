@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Adds SVD features to the data."""
 
 from __future__ import annotations
@@ -16,6 +18,24 @@ from tabpfn.utils import infer_random_state
 
 if TYPE_CHECKING:
     import numpy as np
+
+
+def get_svd_n_components(
+    global_transformer_name: Literal["svd", "svd_quarter_components"],
+    n_samples: int,
+    n_features: int,
+) -> int:
+    """Compute the number of SVD components matching the TabPFN convention.
+
+    Used by both the sklearn and torch SVD feature steps.
+    """
+    if global_transformer_name == "svd":
+        divisor = 2
+    elif global_transformer_name == "svd_quarter_components":
+        divisor = 4
+    else:
+        raise ValueError(f"Invalid global transformer name: {global_transformer_name}.")
+    return max(1, min(n_samples // 10 + 1, n_features // divisor))
 
 
 class AddSVDFeaturesStep(PreprocessingStep):
@@ -40,15 +60,17 @@ class AddSVDFeaturesStep(PreprocessingStep):
         self.random_state = random_state
         self.is_no_op: bool = False
 
-    def num_added_features(self, n_samples: int, n_features: int) -> int:
+    @override
+    def num_added_features(self, n_samples: int, feature_schema: FeatureSchema) -> int:
         """Return the number of added features."""
+        n_features = feature_schema.num_columns
         if n_features < 2:
             return 0
 
         transformer = get_svd_features_transformer(
             self.global_transformer_name,
-            n_samples,
-            n_features,
+            n_samples=n_samples,
+            n_features=n_features,
         )
         svd_transformer = transformer.steps[1][1]
         assert isinstance(svd_transformer, TruncatedSVD)
@@ -60,6 +82,7 @@ class AddSVDFeaturesStep(PreprocessingStep):
         X: np.ndarray,
         feature_schema: FeatureSchema,
     ) -> FeatureSchema:
+        self.is_no_op = False
         n_samples, n_features = X.shape
         if n_features < 2:
             self.is_no_op = True
@@ -99,14 +122,7 @@ def get_svd_features_transformer(
     random_state: int | None = None,
 ) -> Pipeline:
     """Returns a transformer to add SVD features to the data."""
-    if global_transformer_name == "svd":
-        divisor = 2
-    elif global_transformer_name == "svd_quarter_components":
-        divisor = 4
-    else:
-        raise ValueError(f"Invalid global transformer name: {global_transformer_name}.")
-
-    n_components = max(1, min(n_samples // 10 + 1, n_features // divisor))
+    n_components = get_svd_n_components(global_transformer_name, n_samples, n_features)
     return Pipeline(
         steps=[
             (

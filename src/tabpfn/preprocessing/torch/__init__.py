@@ -1,4 +1,4 @@
-#  Copyright (c) Prior Labs GmbH 2025.
+#  Copyright (c) Prior Labs GmbH 2026.
 
 """Torch-based preprocessing utilities."""
 
@@ -11,18 +11,37 @@ from .pipeline_interface import (
     TorchPreprocessingStep,
     TorchPreprocessingStepResult,
 )
-from .steps import TorchSoftClipOutliersStep, TorchStandardScalerStep
+from .steps import (
+    TorchAddFingerprintFeaturesStep,
+    TorchQuantileTransformerStep,
+    TorchSelectiveQuantileTransformerStep,
+    TorchSelectiveSquashingScalerStep,
+    TorchShuffleFeaturesStep,
+    TorchSoftClipOutliersStep,
+    TorchSquashingScalerStep,
+    TorchStandardScalerStep,
+)
+from .torch_quantile_transformer import TorchQuantileTransformer
 from .torch_soft_clip_outliers import TorchSoftClipOutliers
+from .torch_squashing_scaler import TorchSquashingScaler
 from .torch_standard_scaler import TorchStandardScaler
 
 __all__ = [
     "FeatureSchema",
+    "TorchAddFingerprintFeaturesStep",
     "TorchPreprocessingPipeline",
     "TorchPreprocessingPipelineOutput",
     "TorchPreprocessingStep",
     "TorchPreprocessingStepResult",
+    "TorchQuantileTransformer",
+    "TorchQuantileTransformerStep",
+    "TorchSelectiveQuantileTransformerStep",
+    "TorchSelectiveSquashingScalerStep",
+    "TorchShuffleFeaturesStep",
     "TorchSoftClipOutliers",
     "TorchSoftClipOutliersStep",
+    "TorchSquashingScaler",
+    "TorchSquashingScalerStep",
     "TorchStandardScaler",
     "TorchStandardScalerStep",
     "create_gpu_preprocessing_pipeline",

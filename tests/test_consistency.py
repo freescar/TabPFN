@@ -1,3 +1,5 @@
+#  Copyright (c) Prior Labs GmbH 2026.
+
 """Check that the current output of the model matches reference predictions.
 
 This ensures that the output of a model does not change once it has been released, and
@@ -107,74 +109,62 @@ DEFAULT_CONFIG = {"n_estimators": 2, "random_state": 42, "device": "cpu"}
 
 TEST_CASES = {
     **{
-        f"classifier_tiny_dataset_{version.value}_{fit_mode}": _ConsistencyCase(
+        f"classifier_tiny_dataset_{version.value}": _ConsistencyCase(
             data=_get_tiny_classification_data,
             model=partial(
                 TabPFNClassifier.create_default_for_version,
-                fit_mode=fit_mode,
                 version=version,
                 **DEFAULT_CONFIG,
             ),
         )
-        for fit_mode in ["fit_preprocessors", "low_memory"]
-        for version in [ModelVersion.V2, ModelVersion.V2_5, ModelVersion.V2_6]
-        # Save compute by only running all the tests for the latest model.
-        if version == ModelVersion.V2_6 or fit_mode == "fit_preprocessors"
+        for version in [
+            ModelVersion.V2,
+            ModelVersion.V2_5,
+            ModelVersion.V2_6,
+            ModelVersion.V3,
+        ]
     },
     **{
-        f"classifier_tiny_dataset_{version.value}_{fit_mode}": _ConsistencyCase(
-            data=_get_tiny_classification_data,
-            model=partial(
-                TabPFNClassifier.create_default_for_version,
-                fit_mode=fit_mode,
-                version=version,
-                **DEFAULT_CONFIG,
-            ),
-        )
-        for fit_mode in ["fit_with_cache"]
-        for version in [ModelVersion.V2_5]
-    },
-    **{
-        f"regressor_tiny_dataset_{version.value}_{fit_mode}": _ConsistencyCase(
+        f"regressor_tiny_dataset_{version.value}": _ConsistencyCase(
             data=_get_tiny_regression_data,
             model=partial(
                 TabPFNRegressor.create_default_for_version,
-                fit_mode=fit_mode,
                 version=version,
                 **DEFAULT_CONFIG,
             ),
         )
-        for fit_mode in ["fit_preprocessors", "low_memory"]
-        for version in [ModelVersion.V2, ModelVersion.V2_5, ModelVersion.V2_6]
-        # Save compute by only running all the tests for the latest model.
-        if version == ModelVersion.V2_6 or fit_mode == "fit_preprocessors"
+        for version in [
+            ModelVersion.V2,
+            ModelVersion.V2_5,
+            ModelVersion.V2_6,
+            ModelVersion.V3,
+        ]
     },
-    **{
-        f"regressor_tiny_dataset_{version.value}_{fit_mode}": _ConsistencyCase(
-            data=_get_tiny_regression_data,
-            model=partial(
-                TabPFNRegressor.create_default_for_version,
-                fit_mode=fit_mode,
-                version=version,
-                **DEFAULT_CONFIG,
-            ),
-        )
-        for fit_mode in ["fit_with_cache"]
-        for version in [ModelVersion.V2_5]
-    },
-    "classifier_tiny_dataset_differentiable_input": _ConsistencyCase(
+    "classifier_tiny_dataset_differentiable_input_v2.6": _ConsistencyCase(
         data=lambda: _to_tensors(_get_tiny_classification_data()),
         model=lambda: TabPFNClassifier.create_default_for_version(
             version=ModelVersion.V2_6, **DEFAULT_CONFIG, differentiable_input=True
         ),
     ),
-    "classifier_iris_dataset": _ConsistencyCase(
+    "classifier_tiny_dataset_differentiable_input_v3": _ConsistencyCase(
+        data=lambda: _to_tensors(_get_tiny_classification_data()),
+        model=lambda: TabPFNClassifier.create_default_for_version(
+            version=ModelVersion.V3, **DEFAULT_CONFIG, differentiable_input=True
+        ),
+    ),
+    "classifier_iris_dataset_v2.6": _ConsistencyCase(
         data=_get_iris_multiclass_data,
         model=lambda: TabPFNClassifier.create_default_for_version(
             version=ModelVersion.V2_6, **DEFAULT_CONFIG
         ),
     ),
-    "regressor_tiny_dataset_several_devices": _ConsistencyCase(
+    "classifier_iris_dataset_v3": _ConsistencyCase(
+        data=_get_iris_multiclass_data,
+        model=lambda: TabPFNClassifier.create_default_for_version(
+            version=ModelVersion.V3, **DEFAULT_CONFIG
+        ),
+    ),
+    "regressor_tiny_dataset_several_devices_v2.6": _ConsistencyCase(
         data=_get_tiny_regression_data,
         model=lambda: _add_extra_devices(
             TabPFNRegressor.create_default_for_version(
@@ -182,7 +172,15 @@ TEST_CASES = {
             )
         ),
     ),
-    "classifier_iris_dataset_several_devices": _ConsistencyCase(
+    "regressor_tiny_dataset_several_devices_v3": _ConsistencyCase(
+        data=_get_tiny_regression_data,
+        model=lambda: _add_extra_devices(
+            TabPFNRegressor.create_default_for_version(
+                version=ModelVersion.V3, **DEFAULT_CONFIG
+            )
+        ),
+    ),
+    "classifier_iris_dataset_several_devices_v2.6": _ConsistencyCase(
         data=_get_iris_multiclass_data,
         model=lambda: _add_extra_devices(
             TabPFNClassifier.create_default_for_version(
@@ -190,10 +188,24 @@ TEST_CASES = {
             )
         ),
     ),
-    "classifier_tiny_dataset_5_estimators": _ConsistencyCase(
+    "classifier_iris_dataset_several_devices_v3": _ConsistencyCase(
+        data=_get_iris_multiclass_data,
+        model=lambda: _add_extra_devices(
+            TabPFNClassifier.create_default_for_version(
+                version=ModelVersion.V3, **DEFAULT_CONFIG
+            )
+        ),
+    ),
+    "classifier_tiny_dataset_3_estimators_v2.6": _ConsistencyCase(
         data=_get_tiny_classification_data,
         model=lambda: TabPFNClassifier.create_default_for_version(
-            version=ModelVersion.V2_6, **DEFAULT_CONFIG | {"n_estimators": 5}
+            version=ModelVersion.V2_6, **DEFAULT_CONFIG | {"n_estimators": 3}
+        ),
+    ),
+    "classifier_tiny_dataset_3_estimators_v3": _ConsistencyCase(
+        data=_get_tiny_classification_data,
+        model=lambda: TabPFNClassifier.create_default_for_version(
+            version=ModelVersion.V3, **DEFAULT_CONFIG | {"n_estimators": 3}
         ),
     ),
 }
