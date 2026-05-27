@@ -400,8 +400,9 @@ def build_slot_ref_features(
             lot_ref_met_range[idx] = float(np.nanmax(loo_mets) - np.nanmin(loo_mets))
             lot_ref_met_count[idx] = float(n_loo)
             # Interpolation using LOO reference slots/METs
-            loo_slots = np.array([s for s in slot_met_dict if s != curr_slot], dtype=float)
-            loo_met_vals = np.array([slot_met_dict[s] for s in slot_met_dict if s != curr_slot], dtype=np.float32)
+            loo_items = [(s, slot_met_dict[s]) for s in slot_met_dict if s != curr_slot]
+            loo_slots = np.array([s for s, _ in loo_items], dtype=float)
+            loo_met_vals = np.array([m for _, m in loo_items], dtype=np.float32)
             if len(loo_slots) >= 1:
                 order = np.argsort(loo_slots)
                 ref_met_interp[idx] = float(
@@ -724,26 +725,28 @@ def infer_one_dataset(
         slot_col=slot_col,
         reference_slot_ids=reference_slot_ids,
     )
-    # Apply same bias shift to CI bounds
+    # The per-sample bias shift from residual compensation must be applied
+    # consistently to the CI bounds so that the interval remains centred on
+    # the compensated mean prediction.
     bias_shift = y_pred - y_pred_raw
     q_lower = q_lower_raw + bias_shift
     q_upper = q_upper_raw + bias_shift
     t_comp = time.time() - t_comp0
 
     # ── Evaluate (non-ref only) with probability interval metrics ─────────────
-    nrm = test_is_nonref
+    test_is_nonref_mask = ~test_is_ref
     metrics = eval_metrics_prob(
-        y_true=y_test[nrm],
-        y_pred=y_pred[nrm],
-        q_lower=q_lower[nrm],
-        q_upper=q_upper[nrm],
+        y_true=y_test[test_is_nonref_mask],
+        y_pred=y_pred[test_is_nonref_mask],
+        q_lower=q_lower[test_is_nonref_mask],
+        q_upper=q_upper[test_is_nonref_mask],
         conf_width_thresholds=conf_width_thresholds,
     )
 
     t_plot0 = time.time()
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_path = os.path.join(output_dir, f"{safe}_infer_timeseries.png")
-    ci_interval_label = f"CI[{ci_quantile_lower:.0%},{ci_quantile_upper:.0%}]"
+    ci_quantile_label = f"CI[{ci_quantile_lower:.0%},{ci_quantile_upper:.0%}]"
     plot_pred_true_timeseries(
         y_test=y_test,
         y_pred=y_pred,
@@ -751,7 +754,7 @@ def infer_one_dataset(
         title=(
             f"{dataset_name} | COMP Non-ref MAE={metrics['mae']:.4f} R²={metrics['r2']:.4f} "
             f"Acc@0.5={metrics['acc05']:.1f}% Acc@1.0={metrics['acc10']:.1f}% "
-            f"CI-width={metrics['ci_width_mean']:.3f} {ci_interval_label}"
+            f"CI-width={metrics['ci_width_mean']:.3f} {ci_quantile_label}"
         ),
         out_path=plot_path,
         ylabel=target_col,
@@ -839,13 +842,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ci-quantile-lower",
         type=float,
         default=DEFAULT_CI_QUANTILE_LOWER,
-        help="Lower quantile for prediction interval (e.g. 0.1 for 80%% PI).",
+        help=(
+            "Lower quantile for prediction interval (must be in [0, 1]). "
+            "Paired with --ci-quantile-upper: e.g. 0.1 + 0.9 gives an 80%% PI."
+        ),
     )
     p.add_argument(
         "--ci-quantile-upper",
         type=float,
         default=DEFAULT_CI_QUANTILE_UPPER,
-        help="Upper quantile for prediction interval (e.g. 0.9 for 80%% PI).",
+        help=(
+            "Upper quantile for prediction interval (must be in [0, 1] and > --ci-quantile-lower). "
+            "Paired with --ci-quantile-lower: e.g. 0.1 + 0.9 gives an 80%% PI."
+        ),
     )
     p.add_argument(
         "--conf-width-thresholds",
@@ -864,6 +873,18 @@ def main() -> None:
 
     reference_slot_ids = _parse_reference_slot_ids(args.reference_slot_ids)
     conf_width_thresholds = [float(x.strip()) for x in args.conf_width_thresholds.split(",") if x.strip()]
+
+    # Validate CI quantile arguments
+    if not (0.0 <= args.ci_quantile_lower <= 1.0):
+        raise ValueError(f"--ci-quantile-lower must be in [0, 1], got {args.ci_quantile_lower}")
+    if not (0.0 <= args.ci_quantile_upper <= 1.0):
+        raise ValueError(f"--ci-quantile-upper must be in [0, 1], got {args.ci_quantile_upper}")
+    if args.ci_quantile_lower >= args.ci_quantile_upper:
+        raise ValueError(
+            f"--ci-quantile-lower ({args.ci_quantile_lower}) must be < "
+            f"--ci-quantile-upper ({args.ci_quantile_upper})"
+        )
+
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
