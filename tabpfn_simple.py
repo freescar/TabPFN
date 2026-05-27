@@ -61,6 +61,11 @@ DEFAULT_MAX_FEATURES = 120
 DEFAULT_MAX_MISSING_RATIO = 0.60
 DEFAULT_MIN_VARIANCE = 1e-10
 
+# 概率区间 / 置信度阈值
+DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
+DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
+DEFAULT_CONF_WIDTH_THRESHOLDS = "1.0,2.0,3.0"  # CI 宽度阈值列表 (MET 原始单位)
+
 
 # ============================================================
 # IO
@@ -116,6 +121,49 @@ def eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
+def eval_metrics_prob(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    q_lower: np.ndarray,
+    q_upper: np.ndarray,
+    conf_width_thresholds: list[float],
+) -> dict:
+    """Extended metrics including prediction-interval statistics and threshold-based accuracy.
+
+    For each threshold in *conf_width_thresholds*, a "high-confidence" subset is defined as
+    samples whose CI width (q_upper - q_lower) is at most the threshold.  Standard regression
+    metrics are then computed on that subset, together with the coverage fraction.
+    """
+    base = eval_metrics(y_true, y_pred)
+
+    ci_width = q_upper - q_lower
+    empirical_coverage = float(np.mean((y_true >= q_lower) & (y_true <= q_upper)) * 100.0)
+
+    base.update({
+        "ci_width_mean": float(np.mean(ci_width)),
+        "ci_width_median": float(np.median(ci_width)),
+        "ci_empirical_coverage_pct": empirical_coverage,
+    })
+
+    for thr in conf_width_thresholds:
+        high_conf = ci_width <= thr
+        coverage_pct = float(np.mean(high_conf) * 100.0)
+        key_prefix = f"ci_thr{thr:.1f}"
+        base[f"{key_prefix}_coverage_pct"] = coverage_pct
+        if high_conf.sum() > 0:
+            base[f"{key_prefix}_mae"] = float(mean_absolute_error(y_true[high_conf], y_pred[high_conf]))
+            base[f"{key_prefix}_r2"] = float(r2_score(y_true[high_conf], y_pred[high_conf]))
+            base[f"{key_prefix}_acc05"] = float(acc_within(y_true[high_conf], y_pred[high_conf], 0.5))
+            base[f"{key_prefix}_acc10"] = float(acc_within(y_true[high_conf], y_pred[high_conf], 1.0))
+        else:
+            base[f"{key_prefix}_mae"] = float("nan")
+            base[f"{key_prefix}_r2"] = float("nan")
+            base[f"{key_prefix}_acc05"] = float("nan")
+            base[f"{key_prefix}_acc10"] = float("nan")
+
+    return base
+
+
 def plot_pred_true_timeseries(
     y_test: np.ndarray,
     y_pred: np.ndarray,
@@ -123,6 +171,8 @@ def plot_pred_true_timeseries(
     title: str,
     out_path: str,
     ylabel: str,
+    q_lower: np.ndarray | None = None,
+    q_upper: np.ndarray | None = None,
 ) -> None:
     x = np.arange(len(y_test))
     is_nonref = ~test_is_ref
@@ -137,6 +187,17 @@ def plot_pred_true_timeseries(
         color="green",
         label="±0.5 band",
     )
+
+    # Prediction interval (CI) band for non-ref samples
+    if q_lower is not None and q_upper is not None:
+        plt.fill_between(
+            x[is_nonref],
+            q_lower[is_nonref],
+            q_upper[is_nonref],
+            alpha=0.18,
+            color="steelblue",
+            label="pred CI (non-ref)",
+        )
 
     plt.plot(x, y_test, color="black", alpha=0.35, linewidth=1.0, label="true (all)")
     plt.scatter(x[is_nonref], y_test[is_nonref], s=8, color="black", alpha=0.6, label="true (non-ref)")
@@ -187,8 +248,196 @@ def apply_residual_compensation(
 
 
 # ============================================================
-# Fast feature pruning
+# Slot / reference-MET feature engineering
 # ============================================================
+
+def build_slot_ref_features(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    slot_col: str,
+    lot_col: str,
+    reference_slot_ids: list[int],
+) -> pd.DataFrame:
+    """Build a feature matrix using only slot-position and reference-wafer MET data.
+
+    No FDC sensor columns are used.  For each wafer row the following groups are
+    constructed:
+
+    1. **Slot-position features** – normalized position, centre distance, polynomial
+       trend terms, and a binary flag for reference slots.
+    2. **Lot-level reference-MET aggregates** – mean, std, median, min, max, range
+       and count of reference-wafer METs within the same lot.  Reference wafers use
+       leave-one-out aggregation to avoid target leakage.
+    3. **Per-reference-slot MET values** (wide format) – ``ref_slot_{i}_met`` for
+       every slot id in *reference_slot_ids*, taken from the same lot.  A reference
+       wafer's own slot column is set to NaN (leave-one-out).
+    4. **Deviation features** – each wide-format value minus the lot mean.
+    5. **Interpolated reference MET** – piecewise-linear interpolation of reference
+       METs at the current slot position.
+    """
+    slots = df[slot_col].to_numpy()
+    lots = df[lot_col].to_numpy()
+    mets = df[target_col].to_numpy(dtype=np.float32)
+    n_rows = len(df)
+
+    ref_set = set(reference_slot_ids)
+    is_ref = np.isin(slots, reference_slot_ids)
+
+    # ── 1. Slot-position features ─────────────────────────────────────────────
+    slot_vals = df[slot_col].values
+    slot_min = float(slot_vals.min())
+    slot_max = float(slot_vals.max())
+    slot_range = max(slot_max - slot_min, 1.0)
+
+    slot_norm = (slots - slot_min) / slot_range        # [0, 1]
+    slot_center_dist = np.abs(slot_norm - 0.5)         # [0, 0.5]
+
+    feat: dict[str, np.ndarray] = {
+        "slot_id": slots.astype(np.float32),
+        "slot_norm": slot_norm.astype(np.float32),
+        "slot_center_dist": slot_center_dist.astype(np.float32),
+        "slot_trend_sq": (slot_norm ** 2).astype(np.float32),
+        "slot_trend_cubic": (slot_norm ** 3).astype(np.float32),
+        "is_ref_slot": is_ref.astype(np.float32),
+    }
+
+    # Nearest reference slot distance
+    ref_ids_arr = np.array(sorted(ref_set), dtype=float)
+    if len(ref_ids_arr) > 0:
+        nearest_ref_dist = np.min(
+            np.abs(slots[:, None].astype(float) - ref_ids_arr[None, :]), axis=1
+        ).astype(np.float32)
+    else:
+        nearest_ref_dist = np.zeros(n_rows, dtype=np.float32)
+    feat["nearest_ref_dist"] = nearest_ref_dist
+
+    # ── 2. Lot-level reference-MET aggregates (leave-one-out for ref wafers) ──
+    lot_ref_met_mean = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_std = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_median = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_min = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_max = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_range = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_ref_met_count = np.zeros(n_rows, dtype=np.float32)
+
+    # ── 3. Wide-format per-reference-slot MET values ──────────────────────────
+    ref_slot_mets: dict[int, np.ndarray] = {
+        sid: np.full(n_rows, np.nan, dtype=np.float32) for sid in reference_slot_ids
+    }
+
+    # ── 5. Interpolated reference MET at current slot ─────────────────────────
+    ref_met_interp = np.full(n_rows, np.nan, dtype=np.float32)
+
+    for lot in np.unique(lots):
+        lot_mask = lots == lot
+        lot_ref_mask = lot_mask & is_ref
+        n_ref = int(lot_ref_mask.sum())
+        if n_ref == 0:
+            continue
+
+        lot_ref_slots = slots[lot_ref_mask].astype(int)
+        lot_ref_mets = mets[lot_ref_mask]
+
+        # slot -> MET dictionary for this lot's reference wafers
+        slot_met_dict: dict[int, float] = {}
+        for s, m in zip(lot_ref_slots.tolist(), lot_ref_mets.tolist()):
+            slot_met_dict[s] = m
+
+        # Fill wide-format per-slot MET
+        for sid in reference_slot_ids:
+            if sid in slot_met_dict:
+                ref_slot_mets[sid][lot_mask] = slot_met_dict[sid]
+
+        # Precompute full-lot reference stats
+        total_sum = float(np.nansum(lot_ref_mets))
+        total_sum2 = float(np.nansum(lot_ref_mets ** 2))
+
+        # Sorted reference slots/METs for interpolation
+        sort_order = np.argsort(lot_ref_slots)
+        sorted_ref_slots = lot_ref_slots[sort_order].astype(float)
+        sorted_ref_mets = lot_ref_mets[sort_order]
+
+        # Non-reference rows: vectorised fill
+        nonref_indices = np.where(lot_mask & ~is_ref)[0]
+        if len(nonref_indices) > 0:
+            mean_val = total_sum / n_ref
+            var_val = max(total_sum2 / n_ref - mean_val ** 2, 0.0)
+            lot_ref_met_mean[nonref_indices] = mean_val
+            lot_ref_met_std[nonref_indices] = float(np.sqrt(var_val))
+            lot_ref_met_median[nonref_indices] = float(np.nanmedian(lot_ref_mets))
+            lot_ref_met_min[nonref_indices] = float(np.nanmin(lot_ref_mets))
+            lot_ref_met_max[nonref_indices] = float(np.nanmax(lot_ref_mets))
+            lot_ref_met_range[nonref_indices] = float(np.nanmax(lot_ref_mets) - np.nanmin(lot_ref_mets))
+            lot_ref_met_count[nonref_indices] = float(n_ref)
+            for idx in nonref_indices:
+                ref_met_interp[idx] = float(
+                    np.interp(slots[idx], sorted_ref_slots, sorted_ref_mets)
+                )
+
+        # Reference rows: leave-one-out fill
+        ref_indices = np.where(lot_ref_mask)[0]
+        for idx in ref_indices:
+            curr_slot = int(slots[idx])
+            own_met = slot_met_dict.get(curr_slot)
+            if own_met is None:
+                continue
+            n_loo = n_ref - 1
+            if n_loo == 0:
+                continue
+            loo_sum = total_sum - own_met
+            loo_mean = loo_sum / n_loo
+            loo_sum2 = total_sum2 - own_met ** 2
+            loo_std = float(np.sqrt(max(loo_sum2 / n_loo - loo_mean ** 2, 0.0)))
+            loo_mets = np.array(
+                [m for s, m in slot_met_dict.items() if s != curr_slot], dtype=np.float32
+            )
+            lot_ref_met_mean[idx] = loo_mean
+            lot_ref_met_std[idx] = loo_std
+            lot_ref_met_median[idx] = float(np.nanmedian(loo_mets))
+            lot_ref_met_min[idx] = float(np.nanmin(loo_mets))
+            lot_ref_met_max[idx] = float(np.nanmax(loo_mets))
+            lot_ref_met_range[idx] = float(np.nanmax(loo_mets) - np.nanmin(loo_mets))
+            lot_ref_met_count[idx] = float(n_loo)
+            # Interpolation using LOO reference slots/METs
+            loo_items = [(s, slot_met_dict[s]) for s in slot_met_dict if s != curr_slot]
+            loo_slots = np.array([s for s, _ in loo_items], dtype=float)
+            loo_met_vals = np.array([m for _, m in loo_items], dtype=np.float32)
+            if len(loo_slots) >= 1:
+                order = np.argsort(loo_slots)
+                ref_met_interp[idx] = float(
+                    np.interp(float(curr_slot), loo_slots[order], loo_met_vals[order])
+                )
+            # Wide-format: own slot = NaN (leave-one-out)
+            ref_slot_mets[curr_slot][idx] = np.nan
+
+    feat.update({
+        "lot_ref_met_mean": lot_ref_met_mean,
+        "lot_ref_met_std": lot_ref_met_std,
+        "lot_ref_met_median": lot_ref_met_median,
+        "lot_ref_met_min": lot_ref_met_min,
+        "lot_ref_met_max": lot_ref_met_max,
+        "lot_ref_met_range": lot_ref_met_range,
+        "lot_ref_met_count": lot_ref_met_count,
+        "ref_met_interp": ref_met_interp,
+    })
+
+    # Wide-format and deviation columns
+    for sid in reference_slot_ids:
+        feat[f"ref_slot_{sid}_met"] = ref_slot_mets[sid]
+        feat[f"ref_slot_{sid}_met_dev"] = ref_slot_mets[sid] - lot_ref_met_mean
+
+    result = pd.DataFrame(feat, index=df.index)
+
+    # Fill remaining NaNs with column median (robustness for TabPFN)
+    for col in result.columns:
+        if result[col].isna().any():
+            col_median = result[col].median()
+            if np.isnan(col_median):
+                col_median = 0.0
+            result[col] = result[col].fillna(col_median)
+
+    return result
 
 def _coerce_mixed_columns_for_tabpfn(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
@@ -312,6 +561,31 @@ def predict_maybe_batched(model: TabPFNRegressor, X: pd.DataFrame, batch_size: i
     return np.concatenate(preds)
 
 
+def predict_maybe_batched_with_quantiles(
+    model: TabPFNRegressor,
+    X: pd.DataFrame,
+    batch_size: int,
+    ci_quantiles: list[float],
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Return (mean_predictions, [q_lower_array, q_upper_array, ...]) using TabPFN quantile output."""
+    def _predict_batch(batch: pd.DataFrame) -> tuple[np.ndarray, list[np.ndarray]]:
+        result = model.predict(batch, output_type="main", quantiles=ci_quantiles)
+        return result["mean"], result["quantiles"]
+
+    if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
+        return _predict_batch(X)
+
+    means: list[np.ndarray] = []
+    quantile_parts: list[list[np.ndarray]] = [[] for _ in ci_quantiles]
+    for i in range(0, len(X), batch_size):
+        batch_mean, batch_quantiles = _predict_batch(X.iloc[i:i + batch_size])
+        means.append(batch_mean)
+        for j, q_arr in enumerate(batch_quantiles):
+            quantile_parts[j].append(q_arr)
+
+    return np.concatenate(means), [np.concatenate(parts) for parts in quantile_parts]
+
+
 # ============================================================
 # Core
 # ============================================================
@@ -339,6 +613,9 @@ def infer_one_dataset(
     max_features: int,
     max_missing_ratio: float,
     min_variance: float,
+    ci_quantile_lower: float,
+    ci_quantile_upper: float,
+    conf_width_thresholds: list[float],
 ) -> dict | None:
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
@@ -367,18 +644,17 @@ def infer_one_dataset(
     _train_end = int(n_total * train_ratio)
     val_end = int(n_total * val_ratio)
 
-    drop_cols = {target_col, time_col, slot_col, lot_col}
-    if wafer_id_col in df.columns:
-        drop_cols.add(wafer_id_col)
-
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-    if not feature_cols:
-        print(f"  ⚠️ skip {dataset_name}: no feature columns after dropping meta cols")
-        return None
-
+    # ── Build slot/reference-MET features (no FDC data used) ─────────────────
     t_prep0 = time.time()
-    X_raw = df[feature_cols]
     y = df[target_col].astype(float).to_numpy(dtype=np.float32)
+
+    X_raw = build_slot_ref_features(
+        df,
+        target_col=target_col,
+        slot_col=slot_col,
+        lot_col=lot_col,
+        reference_slot_ids=reference_slot_ids,
+    )
     X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
 
     X_train_for_select = X_raw.iloc[:val_end]
@@ -400,7 +676,7 @@ def infer_one_dataset(
         return None
 
     print(
-        f"  feature pruning: raw={fs_info['raw_features']} -> "
+        f"  slot/ref features: {fs_info['raw_features']} -> "
         f"miss={fs_info['after_missing_filter']} -> "
         f"var={fs_info['after_variance_filter']} -> "
         f"final={fs_info['after_score_filter']}"
@@ -418,8 +694,13 @@ def infer_one_dataset(
     model.fit(X_selected.iloc[:val_end], y[:val_end])
     t_fit = time.time() - t_fit0
 
+    # ── Probabilistic prediction (mean + CI quantiles) ─────────────────────────
     t_pred0 = time.time()
-    y_pred_raw = predict_maybe_batched(model, X_selected.iloc[val_end:], batch_size=predict_batch_size)
+    ci_quantiles = [ci_quantile_lower, ci_quantile_upper]
+    y_pred_raw, quantile_arrays = predict_maybe_batched_with_quantiles(
+        model, X_selected.iloc[val_end:], batch_size=predict_batch_size, ci_quantiles=ci_quantiles
+    )
+    q_lower_raw, q_upper_raw = quantile_arrays[0], quantile_arrays[1]
     t_pred = time.time() - t_pred0
 
     infer_time = t_fit + t_pred
@@ -427,6 +708,7 @@ def infer_one_dataset(
     del model
     force_cleanup(light=True)
 
+    # ── Residual compensation (applied to mean predictions and CI bounds) ──────
     t_comp0 = time.time()
     meta_test = pd.DataFrame(
         {
@@ -443,23 +725,41 @@ def infer_one_dataset(
         slot_col=slot_col,
         reference_slot_ids=reference_slot_ids,
     )
+    # The per-sample bias shift from residual compensation must be applied
+    # consistently to the CI bounds so that the interval remains centred on
+    # the compensated mean prediction.
+    bias_shift = y_pred - y_pred_raw
+    q_lower = q_lower_raw + bias_shift
+    q_upper = q_upper_raw + bias_shift
     t_comp = time.time() - t_comp0
 
-    metrics = eval_metrics(y_test[test_is_nonref], y_pred[test_is_nonref])
+    # ── Evaluate (non-ref only) with probability interval metrics ─────────────
+    test_is_nonref_mask = ~test_is_ref
+    metrics = eval_metrics_prob(
+        y_true=y_test[test_is_nonref_mask],
+        y_pred=y_pred[test_is_nonref_mask],
+        q_lower=q_lower[test_is_nonref_mask],
+        q_upper=q_upper[test_is_nonref_mask],
+        conf_width_thresholds=conf_width_thresholds,
+    )
 
     t_plot0 = time.time()
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_path = os.path.join(output_dir, f"{safe}_infer_timeseries.png")
+    ci_quantile_label = f"CI[{ci_quantile_lower:.0%},{ci_quantile_upper:.0%}]"
     plot_pred_true_timeseries(
         y_test=y_test,
         y_pred=y_pred,
         test_is_ref=test_is_ref,
         title=(
             f"{dataset_name} | COMP Non-ref MAE={metrics['mae']:.4f} R²={metrics['r2']:.4f} "
-            f"Acc@0.5={metrics['acc05']:.1f}% Acc@1.0={metrics['acc10']:.1f}%"
+            f"Acc@0.5={metrics['acc05']:.1f}% Acc@1.0={metrics['acc10']:.1f}% "
+            f"CI-width={metrics['ci_width_mean']:.3f} {ci_quantile_label}"
         ),
         out_path=plot_path,
         ylabel=target_col,
+        q_lower=q_lower,
+        q_upper=q_upper,
     )
     t_plot = time.time() - t_plot0
 
@@ -471,7 +771,7 @@ def infer_one_dataset(
     return {
         "dataset": dataset_name,
         "n_rows": int(n_total),
-        "n_features_raw": int(len(feature_cols)),
+        "n_features_raw": int(fs_info["raw_features"]),
         "n_features_used": int(len(selected_cols)),
         "n_test": int(n_total - val_end),
         "n_test_nonref": int(test_is_nonref.sum()),
@@ -538,6 +838,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-missing-ratio", type=float, default=DEFAULT_MAX_MISSING_RATIO)
     p.add_argument("--min-variance", type=float, default=DEFAULT_MIN_VARIANCE)
 
+    p.add_argument(
+        "--ci-quantile-lower",
+        type=float,
+        default=DEFAULT_CI_QUANTILE_LOWER,
+        help=(
+            "Lower quantile for prediction interval (must be in [0, 1]). "
+            "Paired with --ci-quantile-upper: e.g. 0.1 + 0.9 gives an 80%% PI."
+        ),
+    )
+    p.add_argument(
+        "--ci-quantile-upper",
+        type=float,
+        default=DEFAULT_CI_QUANTILE_UPPER,
+        help=(
+            "Upper quantile for prediction interval (must be in [0, 1] and > --ci-quantile-lower). "
+            "Paired with --ci-quantile-lower: e.g. 0.1 + 0.9 gives an 80%% PI."
+        ),
+    )
+    p.add_argument(
+        "--conf-width-thresholds",
+        type=str,
+        default=DEFAULT_CONF_WIDTH_THRESHOLDS,
+        help='Comma-separated CI-width thresholds for high-confidence evaluation, e.g. "1.0,2.0,3.0".',
+    )
+
     return p
 
 
@@ -547,11 +872,28 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     reference_slot_ids = _parse_reference_slot_ids(args.reference_slot_ids)
+    conf_width_thresholds = [float(x.strip()) for x in args.conf_width_thresholds.split(",") if x.strip()]
+
+    # Validate CI quantile arguments
+    if not (0.0 <= args.ci_quantile_lower <= 1.0):
+        raise ValueError(f"--ci-quantile-lower must be in [0, 1], got {args.ci_quantile_lower}")
+    if not (0.0 <= args.ci_quantile_upper <= 1.0):
+        raise ValueError(f"--ci-quantile-upper must be in [0, 1], got {args.ci_quantile_upper}")
+    if args.ci_quantile_lower >= args.ci_quantile_upper:
+        raise ValueError(
+            f"--ci-quantile-lower ({args.ci_quantile_lower}) must be < "
+            f"--ci-quantile-upper ({args.ci_quantile_upper})"
+        )
+
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     files = discover_files(args.data_path)
     print(f"Found {len(files)} file(s). OUTPUT_DIR={args.output_dir}")
+    print(
+        f"CI interval: [{args.ci_quantile_lower:.0%}, {args.ci_quantile_upper:.0%}] | "
+        f"conf-width thresholds: {conf_width_thresholds}"
+    )
 
     all_results = []
     t_all = time.time()
@@ -585,6 +927,9 @@ def main() -> None:
                 max_features=args.max_features,
                 max_missing_ratio=args.max_missing_ratio,
                 min_variance=args.min_variance,
+                ci_quantile_lower=args.ci_quantile_lower,
+                ci_quantile_upper=args.ci_quantile_upper,
+                conf_width_thresholds=conf_width_thresholds,
             )
             if res is not None:
                 all_results.append(res)
@@ -592,7 +937,21 @@ def main() -> None:
                 print(
                     f"  COMP Non-ref: MAE={m['mae']:.4f} R²={m['r2']:.4f} "
                     f"Acc@0.5={m['acc05']:.1f}% Acc@1.0={m['acc10']:.1f}% "
-                    f"| time={res['time_sec']:.1f}s "
+                    f"| CI-width mean={m['ci_width_mean']:.3f} median={m['ci_width_median']:.3f} "
+                    f"| empirical-coverage={m['ci_empirical_coverage_pct']:.1f}%"
+                )
+                for thr in conf_width_thresholds:
+                    key = f"ci_thr{thr:.1f}"
+                    cov = m.get(f"{key}_coverage_pct", float("nan"))
+                    thr_mae = m.get(f"{key}_mae", float("nan"))
+                    thr_acc05 = m.get(f"{key}_acc05", float("nan"))
+                    thr_acc10 = m.get(f"{key}_acc10", float("nan"))
+                    print(
+                        f"    CI-width≤{thr:.1f}: coverage={cov:.1f}% "
+                        f"MAE={thr_mae:.4f} Acc@0.5={thr_acc05:.1f}% Acc@1.0={thr_acc10:.1f}%"
+                    )
+                print(
+                    f"  | time={res['time_sec']:.1f}s "
                     f"| features={res['n_features_raw']}->{res['n_features_used']}"
                 )
                 print(f"  plot={res['plot']}")
@@ -608,10 +967,24 @@ def main() -> None:
         avg_mae = float(np.mean([r["metrics"]["mae"] for r in all_results]))
         avg_acc05 = float(np.mean([r["metrics"]["acc05"] for r in all_results]))
         avg_acc10 = float(np.mean([r["metrics"]["acc10"] for r in all_results]))
+        avg_ci_width = float(np.mean([r["metrics"]["ci_width_mean"] for r in all_results]))
+        avg_ci_cov = float(np.mean([r["metrics"]["ci_empirical_coverage_pct"] for r in all_results]))
         print(
             f"AVG COMP Non-ref MAE={avg_mae:.4f} | "
-            f"AVG Acc@0.5={avg_acc05:.1f}% | AVG Acc@1.0={avg_acc10:.1f}%"
+            f"AVG Acc@0.5={avg_acc05:.1f}% | AVG Acc@1.0={avg_acc10:.1f}% | "
+            f"AVG CI-width={avg_ci_width:.3f} | AVG empirical-coverage={avg_ci_cov:.1f}%"
         )
+        for thr in conf_width_thresholds:
+            key = f"ci_thr{thr:.1f}"
+            valid = [r["metrics"] for r in all_results if not np.isnan(r["metrics"].get(f"{key}_mae", float("nan")))]
+            if valid:
+                avg_thr_cov = float(np.mean([m[f"{key}_coverage_pct"] for m in valid]))
+                avg_thr_mae = float(np.mean([m[f"{key}_mae"] for m in valid]))
+                avg_thr_acc05 = float(np.mean([m[f"{key}_acc05"] for m in valid]))
+                print(
+                    f"  AVG CI-width≤{thr:.1f}: coverage={avg_thr_cov:.1f}% "
+                    f"MAE={avg_thr_mae:.4f} Acc@0.5={avg_thr_acc05:.1f}%"
+                )
 
 
 if __name__ == "__main__":
