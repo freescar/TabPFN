@@ -61,6 +61,12 @@ DEFAULT_MAX_FEATURES = 120
 DEFAULT_MAX_MISSING_RATIO = 0.60
 DEFAULT_MIN_VARIANCE = 1e-10
 
+# 可学习先验状态特征
+DEFAULT_TEMPORAL_LOT_WINDOW_K = 5      # 方案一：时序漂移窗口大小
+DEFAULT_RESIDUAL_PCA_COMPONENTS = 2    # 方案三：残差 PCA 分量数
+DEFAULT_LEARN_LOT_STATE = False        # 方案二：是否启用 per-lot 可学习状态向量
+DEFAULT_LOT_STATE_DIMS = 2             # 方案二：状态向量维度
+
 # 概率区间 / 置信度阈值
 DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
 DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
@@ -440,6 +446,160 @@ def build_slot_ref_features(
     return result
 
 
+def build_temporal_lot_features(
+    df: pd.DataFrame,
+    *,
+    time_col: str,
+    lot_col: str,
+    target_col: str,
+    slot_col: str,
+    reference_slot_ids: list[int],
+    window_k: int = 5,
+) -> pd.DataFrame:
+    """Build cross-lot temporal drift features for each wafer row.
+
+    For each lot, uses the reference-MET statistics of the ``window_k`` most
+    recent **preceding** lots (strictly earlier by earliest ``time_col``) as
+    proxy features for the unknown prior state of the wafer before this step.
+
+    No data leakage: only lots whose earliest timestamp is strictly before the
+    current lot's earliest timestamp are included.
+
+    Returns a DataFrame aligned to ``df`` with columns:
+        - ``prev_k_lots_ref_mean``   : mean of reference METs across the window
+        - ``prev_k_lots_ref_std``    : std of reference METs across the window
+        - ``prev_k_lots_ref_min``    : min lot-mean reference MET in the window
+        - ``prev_k_lots_ref_max``    : max lot-mean reference MET in the window
+        - ``prev_k_lots_ref_trend``  : linear slope of lot-mean METs over the window
+        - ``prev_lot_ref_mean``      : reference MET mean of the immediately preceding lot
+        - ``lot_rank_in_window``     : 0-based temporal rank of this lot
+        - ``lot_time_gap_hours``     : hours between this lot's first sample and the
+                                       previous lot's first sample
+    """
+    lots = df[lot_col].to_numpy()
+    mets = df[target_col].to_numpy(dtype=np.float32)
+    slots = df[slot_col].to_numpy()
+    times = df[time_col].to_numpy()
+    n_rows = len(df)
+    is_ref = np.isin(slots, reference_slot_ids)
+
+    # Compute per-lot: earliest timestamp and mean reference MET
+    unique_lots = np.unique(lots)
+    lot_earliest_time: dict = {}
+    lot_ref_mean: dict = {}
+
+    for lot in unique_lots:
+        lot_mask = lots == lot
+        lot_times = times[lot_mask]
+        try:
+            lot_earliest_time[lot] = np.min(lot_times)
+        except Exception:
+            lot_earliest_time[lot] = lot_times[0]
+
+        lot_ref_mask = lot_mask & is_ref
+        if lot_ref_mask.any():
+            lot_ref_mean[lot] = float(np.nanmean(mets[lot_ref_mask]))
+        else:
+            lot_ref_mean[lot] = np.nan
+
+    # Sort lots by earliest time to establish temporal order
+    try:
+        lots_sorted = sorted(unique_lots, key=lambda lo: lot_earliest_time[lo])
+    except Exception:
+        lots_sorted = list(unique_lots)
+
+    lot_rank = {lot: i for i, lot in enumerate(lots_sorted)}
+
+    # Output arrays
+    prev_k_ref_mean = np.full(n_rows, np.nan, dtype=np.float32)
+    prev_k_ref_std = np.full(n_rows, np.nan, dtype=np.float32)
+    prev_k_ref_min = np.full(n_rows, np.nan, dtype=np.float32)
+    prev_k_ref_max = np.full(n_rows, np.nan, dtype=np.float32)
+    prev_k_ref_trend = np.full(n_rows, np.nan, dtype=np.float32)
+    prev_lot_ref_mean_arr = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_rank_arr = np.full(n_rows, np.nan, dtype=np.float32)
+    lot_time_gap_arr = np.full(n_rows, np.nan, dtype=np.float32)
+
+    for lot in unique_lots:
+        lot_mask = lots == lot
+        rank = lot_rank[lot]
+        lot_rank_arr[lot_mask] = float(rank)
+
+        # Preceding lots within the window (strictly before current lot)
+        preceding = lots_sorted[max(0, rank - window_k): rank]
+        if not preceding:
+            continue
+
+        # Reference MET means of preceding lots (only where available)
+        prev_means = [
+            lot_ref_mean[pl] for pl in preceding if not np.isnan(lot_ref_mean.get(pl, np.nan))
+        ]
+        if not prev_means:
+            continue
+
+        prev_arr = np.array(prev_means, dtype=np.float32)
+        prev_k_ref_mean[lot_mask] = float(np.nanmean(prev_arr))
+        prev_k_ref_std[lot_mask] = float(np.nanstd(prev_arr)) if len(prev_arr) > 1 else 0.0
+        prev_k_ref_min[lot_mask] = float(np.nanmin(prev_arr))
+        prev_k_ref_max[lot_mask] = float(np.nanmax(prev_arr))
+
+        # Most recent preceding lot's reference mean
+        prev_lot_ref_mean_arr[lot_mask] = float(lot_ref_mean.get(preceding[-1], np.nan))
+
+        # Linear trend of lot-mean METs across the window
+        if len(prev_arr) >= 2:
+            x_t = np.arange(len(prev_arr), dtype=np.float32)
+            x_c = x_t - x_t.mean()
+            denom = float(np.dot(x_c, x_c))
+            if denom > 0.0:
+                slope = float(np.dot(x_c, prev_arr - float(prev_arr.mean())) / denom)
+            else:
+                slope = 0.0
+            prev_k_ref_trend[lot_mask] = slope
+        else:
+            prev_k_ref_trend[lot_mask] = 0.0
+
+        # Time gap between this lot and the immediately preceding lot (in hours)
+        prev_lot = preceding[-1]
+        try:
+            curr_t = lot_earliest_time[lot]
+            prev_t = lot_earliest_time[prev_lot]
+            delta = curr_t - prev_t
+            if hasattr(delta, "total_seconds"):
+                gap_h = float(delta.total_seconds()) / 3600.0
+            elif hasattr(delta, "astype"):
+                gap_h = float(delta.astype("timedelta64[s]").astype(np.float64)) / 3600.0
+            else:
+                gap_h = float(delta) / 3600.0
+            lot_time_gap_arr[lot_mask] = gap_h
+        except Exception:
+            pass
+
+    result = pd.DataFrame(
+        {
+            "prev_k_lots_ref_mean": prev_k_ref_mean,
+            "prev_k_lots_ref_std": prev_k_ref_std,
+            "prev_k_lots_ref_min": prev_k_ref_min,
+            "prev_k_lots_ref_max": prev_k_ref_max,
+            "prev_k_lots_ref_trend": prev_k_ref_trend,
+            "prev_lot_ref_mean": prev_lot_ref_mean_arr,
+            "lot_rank_in_window": lot_rank_arr,
+            "lot_time_gap_hours": lot_time_gap_arr,
+        },
+        index=df.index,
+    )
+
+    # Fill remaining NaNs with column median
+    for col in result.columns:
+        if result[col].isna().any():
+            med = result[col].median()
+            if np.isnan(med):
+                med = 0.0
+            result[col] = result[col].fillna(med)
+
+    return result
+
+
 def _build_lot_reference_profiles(
     df: pd.DataFrame,
     *,
@@ -480,6 +640,7 @@ def fit_global_reference_model(
     lot_col: str,
     reference_slot_ids: list[int],
     n_components: int = 3,
+    n_residual_components: int = 2,
 ) -> dict[str, np.ndarray]:
     ref_ids = list(reference_slot_ids)
     n_ref = len(ref_ids)
@@ -489,6 +650,7 @@ def fit_global_reference_model(
             "slot_fill_values": np.array([], dtype=np.float32),
             "template_profile": np.array([], dtype=np.float32),
             "components": np.empty((0, 0), dtype=np.float32),
+            "residual_components": np.empty((0, 0), dtype=np.float32),
         }
 
     lot_profiles = _build_lot_reference_profiles(
@@ -507,6 +669,7 @@ def fit_global_reference_model(
         slot_fill_values = np.zeros(n_ref, dtype=np.float32)
         template_profile = np.zeros(n_ref, dtype=np.float32)
         components = np.empty((0, n_ref), dtype=np.float32)
+        residual_components = np.empty((0, n_ref), dtype=np.float32)
     else:
         slot_fill_values = np.zeros(n_ref, dtype=np.float32)
         for j in range(n_ref):
@@ -520,6 +683,7 @@ def fit_global_reference_model(
         n_comp = min(int(n_components), centered.shape[0], centered.shape[1])
         if n_comp <= 0:
             components = np.empty((0, n_ref), dtype=np.float32)
+            residual_components = np.empty((0, n_ref), dtype=np.float32)
         else:
             try:
                 _, _, vh = np.linalg.svd(centered, full_matrices=False)
@@ -527,11 +691,26 @@ def fit_global_reference_model(
             except np.linalg.LinAlgError:
                 components = np.empty((0, n_ref), dtype=np.float32)
 
+            # 方案三: Residual PCA – decompose variation unexplained by primary components
+            n_resid_comp = min(int(n_residual_components), centered.shape[0], centered.shape[1])
+            if n_resid_comp <= 0 or components.shape[0] == 0:
+                residual_components = np.empty((0, n_ref), dtype=np.float32)
+            else:
+                try:
+                    proj = centered @ components.T          # (n_lots, n_comp)
+                    reconstruction = proj @ components      # (n_lots, n_ref)
+                    resid_mat = centered - reconstruction   # unexplained variation
+                    _, _, vh_r = np.linalg.svd(resid_mat, full_matrices=False)
+                    residual_components = vh_r[:n_resid_comp].astype(np.float32)
+                except np.linalg.LinAlgError:
+                    residual_components = np.empty((0, n_ref), dtype=np.float32)
+
     return {
         "reference_slot_ids": np.asarray(ref_ids, dtype=np.int32),
         "slot_fill_values": slot_fill_values,
         "template_profile": template_profile,
         "components": components,
+        "residual_components": residual_components,
     }
 
 
@@ -551,6 +730,9 @@ def append_global_reference_features(
     template_profile = np.asarray(global_ref_model.get("template_profile", np.array([])), dtype=np.float32)
     slot_fill_values = np.asarray(global_ref_model.get("slot_fill_values", np.array([])), dtype=np.float32)
     components = np.asarray(global_ref_model.get("components", np.empty((0, 0))), dtype=np.float32)
+    residual_components = np.asarray(
+        global_ref_model.get("residual_components", np.empty((0, 0))), dtype=np.float32
+    )
     model_ref_ids = np.asarray(
         global_ref_model.get("reference_slot_ids", np.asarray(reference_slot_ids, dtype=np.int32)),
         dtype=np.int32,
@@ -576,6 +758,7 @@ def append_global_reference_features(
 
     n_rows = len(df)
     n_comp = int(components.shape[0]) if components.ndim == 2 else 0
+    n_resid_comp = int(residual_components.shape[0]) if residual_components.ndim == 2 else 0
     eps = 1e-8
     template_norm = float(np.linalg.norm(template_profile))
     template_norm2 = float(np.dot(template_profile, template_profile))
@@ -588,6 +771,11 @@ def append_global_reference_features(
         interp_ref_ids = interp_ref_ids[sort_idx]
         interp_template_profile = interp_template_profile[sort_idx]
 
+    # Slot normalisation for cross-product features
+    slot_min = float(slots.min())
+    slot_range = max(float(slots.max()) - slot_min, 1.0)
+    slot_norm_all = (slots.astype(np.float32) - slot_min) / slot_range
+
     global_ref_profile_mean = np.full(n_rows, np.nan, dtype=np.float32)
     global_ref_profile_std = np.full(n_rows, np.nan, dtype=np.float32)
     global_ref_template_cos = np.full(n_rows, np.nan, dtype=np.float32)
@@ -596,6 +784,7 @@ def append_global_reference_features(
     global_ref_resid_rmse = np.full(n_rows, np.nan, dtype=np.float32)
     global_ref_template_interp = np.full(n_rows, np.nan, dtype=np.float32)
     pc_scores = np.zeros((n_rows, n_comp), dtype=np.float32)
+    resid_pc_scores = np.zeros((n_rows, n_resid_comp), dtype=np.float32)
 
     for lot in np.unique(lots):
         lot_mask = lots == lot
@@ -628,6 +817,16 @@ def append_global_reference_features(
             lot_scores = centered_profile @ components.T
             pc_scores[lot_idx, :] = lot_scores[None, :]
 
+        # 方案三: Project onto residual PCA components
+        if n_resid_comp > 0 and residual_components.shape[1] == len(reference_slot_ids):
+            # Remove primary-component reconstruction before projecting
+            if n_comp > 0:
+                lot_resid_vec = centered_profile - (centered_profile @ components.T) @ components
+            else:
+                lot_resid_vec = centered_profile
+            lot_resid_scores = lot_resid_vec @ residual_components.T
+            resid_pc_scores[lot_idx, :] = lot_resid_scores[None, :]
+
         if len(interp_ref_ids) >= 2:
             global_ref_template_interp[lot_idx] = np.interp(slots[lot_idx], interp_ref_ids, interp_template_profile)
         elif len(interp_ref_ids) == 1:
@@ -647,6 +846,13 @@ def append_global_reference_features(
 
     for j in range(n_comp):
         X[f"global_ref_pc{j + 1}"] = pc_scores[:, j]
+
+    # 方案三: Residual PCA scores and slot-position cross-products
+    for j in range(n_resid_comp):
+        col_name = f"global_ref_resid_pc{j + 1}"
+        X[col_name] = resid_pc_scores[:, j]
+        # Cross-product with normalised slot position captures position-dependent unexplained variation
+        X[f"{col_name}_x_slot"] = resid_pc_scores[:, j] * slot_norm_all
 
     return X
 
@@ -798,6 +1004,80 @@ def predict_maybe_batched_with_quantiles(
     return np.concatenate(means), [np.concatenate(parts) for parts in quantile_parts]
 
 
+def fit_lot_latent_states(
+    model: TabPFNRegressor,
+    X_selected: pd.DataFrame,
+    y: np.ndarray,
+    df_meta: pd.DataFrame,
+    *,
+    lot_col: str,
+    slot_col: str,
+    reference_slot_ids: list[int],
+    n_dims: int = 2,
+) -> pd.DataFrame:
+    """Fit per-lot latent state vectors from initial-model residuals on reference wafers.
+
+    Uses the already-fit ``model`` to compute predictions for **all** rows, then
+    for each lot performs a closed-form linear least-squares fit on the
+    reference-wafer residuals (``y_ref - pred_ref``) to extract a K-dimensional
+    latent state vector.  The K coefficients are broadcast to every wafer row in
+    that lot as new features ``latent_state_1``…``latent_state_{n_dims}``.
+
+    The basis functions are ``[1, slot_norm, slot_norm², …]`` up to ``n_dims``
+    terms, giving:
+        - ``latent_state_1`` – systematic bias (intercept of the residual model)
+        - ``latent_state_2`` – slot-position trend of residuals (slope)
+        - higher dims – higher-order polynomial coefficients
+
+    For lots that have no reference wafers the latent states are set to 0.
+
+    Returns a :class:`pandas.DataFrame` aligned to ``df_meta`` containing the
+    ``n_dims`` latent state columns.
+    """
+    n_dims = max(1, int(n_dims))
+    lots = df_meta[lot_col].to_numpy()
+    slots = df_meta[slot_col].to_numpy(dtype=np.float32)
+    is_ref = np.isin(slots, list(reference_slot_ids))
+    n_rows = len(df_meta)
+
+    # Predict all rows with the initial model (one pass)
+    preds = model.predict(X_selected)
+
+    # Normalise slot positions across the full dataset for consistent basis
+    slot_min = float(slots.min())
+    slot_range = max(float(slots.max()) - slot_min, 1.0)
+    slot_norm = (slots - slot_min) / slot_range
+
+    latent = np.zeros((n_rows, n_dims), dtype=np.float32)
+
+    for lot in np.unique(lots):
+        lot_mask = lots == lot
+        lot_ref_mask = lot_mask & is_ref
+        n_ref_in_lot = int(lot_ref_mask.sum())
+
+        if n_ref_in_lot == 0:
+            continue
+
+        resid = (y[lot_ref_mask] - preds[lot_ref_mask]).astype(np.float64)
+        slot_norm_ref = slot_norm[lot_ref_mask].astype(np.float64)
+
+        # Build basis matrix [1, s, s², …] for the reference rows
+        n_basis = min(n_dims, n_ref_in_lot)
+        phi_ref = np.column_stack([slot_norm_ref ** d for d in range(n_basis)])  # (n_ref, n_basis)
+
+        try:
+            v, _, _, _ = np.linalg.lstsq(phi_ref, resid, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Store each coefficient as a lot-level scalar (broadcast to all rows)
+        for d in range(n_basis):
+            latent[lot_mask, d] = float(v[d])
+
+    cols = {f"latent_state_{d + 1}": latent[:, d] for d in range(n_dims)}
+    return pd.DataFrame(cols, index=df_meta.index)
+
+
 # ============================================================
 # Core
 # ============================================================
@@ -828,6 +1108,10 @@ def infer_one_dataset(
     ci_quantile_lower: float,
     ci_quantile_upper: float,
     conf_width_thresholds: list[float],
+    temporal_lot_window_k: int = DEFAULT_TEMPORAL_LOT_WINDOW_K,
+    residual_pca_components: int = DEFAULT_RESIDUAL_PCA_COMPONENTS,
+    learn_lot_state: bool = DEFAULT_LEARN_LOT_STATE,
+    lot_state_dims: int = DEFAULT_LOT_STATE_DIMS,
 ) -> dict | None:
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
@@ -866,6 +1150,7 @@ def infer_one_dataset(
         slot_col=slot_col,
         lot_col=lot_col,
         reference_slot_ids=reference_slot_ids,
+        n_residual_components=residual_pca_components,
     )
 
     X_raw = build_slot_ref_features(
@@ -884,6 +1169,20 @@ def infer_one_dataset(
         reference_slot_ids=reference_slot_ids,
         global_ref_model=global_ref_model,
     )
+
+    # 方案一: Append cross-lot temporal drift features
+    if temporal_lot_window_k > 0:
+        X_temporal = build_temporal_lot_features(
+            df,
+            time_col=time_col,
+            lot_col=lot_col,
+            target_col=target_col,
+            slot_col=slot_col,
+            reference_slot_ids=reference_slot_ids,
+            window_k=temporal_lot_window_k,
+        )
+        X_raw = pd.concat([X_raw, X_temporal], axis=1)
+
     X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
 
     X_train_for_select = X_raw.iloc[:val_end]
@@ -922,6 +1221,43 @@ def infer_one_dataset(
     )
     model.fit(X_selected.iloc[:val_end], y[:val_end])
     t_fit = time.time() - t_fit0
+
+    # 方案二: Per-lot learnable latent state (optional two-stage refinement) ────
+    if learn_lot_state and lot_state_dims > 0 and len(reference_slot_ids) > 0:
+        t_latent0 = time.time()
+        df_meta_full = pd.DataFrame(
+            {lot_col: lot_ids.to_numpy(), slot_col: slots},
+            index=df.index,
+        )
+        latent_df = fit_lot_latent_states(
+            model=model,
+            X_selected=X_selected,
+            y=y,
+            df_meta=df_meta_full,
+            lot_col=lot_col,
+            slot_col=slot_col,
+            reference_slot_ids=reference_slot_ids,
+            n_dims=lot_state_dims,
+        )
+        # Augment feature matrix with latent state columns (always included; bypass
+        # feature selection since they are the target signal).
+        X_selected = pd.concat(
+            [X_selected, latent_df.astype(np.float32)], axis=1
+        )
+        # Refit the model on the augmented training features
+        del model
+        force_cleanup(light=True)
+        model = create_model(
+            model_path=model_path,
+            n_estimators=n_estimators,
+            softmax_temperature=softmax_temperature,
+            average_before_softmax=average_before_softmax,
+            poly_features=poly_features,
+            subsample_samples=subsample_samples,
+        )
+        model.fit(X_selected.iloc[:val_end], y[:val_end])
+        t_latent = time.time() - t_latent0
+        print(f"  latent-state fit: dims={lot_state_dims} t={t_latent:.2f}s")
 
     # ── Probabilistic prediction (mean + CI quantiles) ─────────────────────────
     t_pred0 = time.time()
@@ -1067,6 +1403,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-missing-ratio", type=float, default=DEFAULT_MAX_MISSING_RATIO)
     p.add_argument("--min-variance", type=float, default=DEFAULT_MIN_VARIANCE)
 
+    # ── 可学习先验状态特征 ──────────────────────────────────────────────────────
+    p.add_argument(
+        "--temporal-lot-window-k",
+        type=int,
+        default=DEFAULT_TEMPORAL_LOT_WINDOW_K,
+        help=(
+            "方案一: 时序漂移特征窗口。使用当前 lot 之前最近 K 个 lot 的参考片 MET 统计量作为特征。"
+            " 设为 0 可禁用。"
+        ),
+    )
+    p.add_argument(
+        "--residual-pca-components",
+        type=int,
+        default=DEFAULT_RESIDUAL_PCA_COMPONENTS,
+        help=(
+            "方案三: 残差 PCA 分量数。在全局参考模板 PCA 之后，对残差向量再做一次 PCA，"
+            "取 top-N 分量作为特征。设为 0 可禁用。"
+        ),
+    )
+    p.add_argument(
+        "--learn-lot-state",
+        action="store_true",
+        default=DEFAULT_LEARN_LOT_STATE,
+        help=(
+            "方案二: 启用 per-lot 可学习状态向量。对每个 lot 用参考片残差拟合一个 K 维潜变量，"
+            "追加为特征后重新拟合模型。"
+        ),
+    )
+    p.add_argument(
+        "--lot-state-dims",
+        type=int,
+        default=DEFAULT_LOT_STATE_DIMS,
+        help="方案二: 每个 lot 的潜变量维度 K（需同时设置 --learn-lot-state）。",
+    )
+
     p.add_argument(
         "--ci-quantile-lower",
         type=float,
@@ -1159,6 +1530,10 @@ def main() -> None:
                 ci_quantile_lower=args.ci_quantile_lower,
                 ci_quantile_upper=args.ci_quantile_upper,
                 conf_width_thresholds=conf_width_thresholds,
+                temporal_lot_window_k=args.temporal_lot_window_k,
+                residual_pca_components=args.residual_pca_components,
+                learn_lot_state=args.learn_lot_state,
+                lot_state_dims=args.lot_state_dims,
             )
             if res is not None:
                 all_results.append(res)
