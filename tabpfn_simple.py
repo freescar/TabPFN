@@ -61,11 +61,11 @@ DEFAULT_MAX_FEATURES = 120
 DEFAULT_MAX_MISSING_RATIO = 0.60
 DEFAULT_MIN_VARIANCE = 1e-10
 
-# 可学习先验状态特征
-DEFAULT_TEMPORAL_LOT_WINDOW_K = 5      # 方案一：时序漂移窗口大小
-DEFAULT_RESIDUAL_PCA_COMPONENTS = 2    # 方案三：残差 PCA 分量数
-DEFAULT_LEARN_LOT_STATE = False        # 方案二：是否启用 per-lot 可学习状态向量
-DEFAULT_LOT_STATE_DIMS = 2             # 方案二：状态向量维度
+# Learnable prior-state features
+DEFAULT_TEMPORAL_LOT_WINDOW_K = 5      # Approach 1: temporal drift window size
+DEFAULT_RESIDUAL_PCA_COMPONENTS = 2    # Approach 3: residual PCA component count
+DEFAULT_LEARN_LOT_STATE = False        # Approach 2: enable per-lot latent state vectors
+DEFAULT_LOT_STATE_DIMS = 2             # Approach 2: latent state dimensionality K
 
 # 概率区间 / 置信度阈值
 DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
@@ -691,7 +691,7 @@ def fit_global_reference_model(
             except np.linalg.LinAlgError:
                 components = np.empty((0, n_ref), dtype=np.float32)
 
-            # 方案三: Residual PCA – decompose variation unexplained by primary components
+            # Approach 3 (residual PCA): decompose variation unexplained by primary components
             n_resid_comp = min(int(n_residual_components), centered.shape[0], centered.shape[1])
             if n_resid_comp <= 0 or components.shape[0] == 0:
                 residual_components = np.empty((0, n_ref), dtype=np.float32)
@@ -817,7 +817,7 @@ def append_global_reference_features(
             lot_scores = centered_profile @ components.T
             pc_scores[lot_idx, :] = lot_scores[None, :]
 
-        # 方案三: Project onto residual PCA components
+        # Approach 3 (residual PCA): project onto residual PCA components
         if n_resid_comp > 0 and residual_components.shape[1] == len(reference_slot_ids):
             # Remove primary-component reconstruction before projecting
             if n_comp > 0:
@@ -847,7 +847,7 @@ def append_global_reference_features(
     for j in range(n_comp):
         X[f"global_ref_pc{j + 1}"] = pc_scores[:, j]
 
-    # 方案三: Residual PCA scores and slot-position cross-products
+    # Approach 3 (residual PCA): residual PCA scores and slot-position cross-products
     for j in range(n_resid_comp):
         col_name = f"global_ref_resid_pc{j + 1}"
         X[col_name] = resid_pc_scores[:, j]
@@ -1066,13 +1066,13 @@ def fit_lot_latent_states(
         phi_ref = np.column_stack([slot_norm_ref ** d for d in range(n_basis)])  # (n_ref, n_basis)
 
         try:
-            v, _, _, _ = np.linalg.lstsq(phi_ref, resid, rcond=None)
+            coeffs, _, _, _ = np.linalg.lstsq(phi_ref, resid, rcond=None)
         except np.linalg.LinAlgError:
             continue
 
         # Store each coefficient as a lot-level scalar (broadcast to all rows)
         for d in range(n_basis):
-            latent[lot_mask, d] = float(v[d])
+            latent[lot_mask, d] = float(coeffs[d])
 
     cols = {f"latent_state_{d + 1}": latent[:, d] for d in range(n_dims)}
     return pd.DataFrame(cols, index=df_meta.index)
@@ -1170,7 +1170,7 @@ def infer_one_dataset(
         global_ref_model=global_ref_model,
     )
 
-    # 方案一: Append cross-lot temporal drift features
+    # Approach 1 (temporal drift): append cross-lot temporal drift features
     if temporal_lot_window_k > 0:
         X_temporal = build_temporal_lot_features(
             df,
@@ -1222,7 +1222,7 @@ def infer_one_dataset(
     model.fit(X_selected.iloc[:val_end], y[:val_end])
     t_fit = time.time() - t_fit0
 
-    # 方案二: Per-lot learnable latent state (optional two-stage refinement) ────
+    # Approach 2 (learnable latent state): per-lot state vector, optional two-stage refinement ──
     if learn_lot_state and lot_state_dims > 0 and len(reference_slot_ids) > 0:
         t_latent0 = time.time()
         df_meta_full = pd.DataFrame(
@@ -1403,14 +1403,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-missing-ratio", type=float, default=DEFAULT_MAX_MISSING_RATIO)
     p.add_argument("--min-variance", type=float, default=DEFAULT_MIN_VARIANCE)
 
-    # ── 可学习先验状态特征 ──────────────────────────────────────────────────────
+    # ── Learnable prior-state features ────────────────────────────────────────
     p.add_argument(
         "--temporal-lot-window-k",
         type=int,
         default=DEFAULT_TEMPORAL_LOT_WINDOW_K,
         help=(
-            "方案一: 时序漂移特征窗口。使用当前 lot 之前最近 K 个 lot 的参考片 MET 统计量作为特征。"
-            " 设为 0 可禁用。"
+            "Approach 1 (temporal drift): window size for cross-lot drift features. "
+            "Uses the K most recent preceding lots' reference-MET statistics as features. "
+            "Set to 0 to disable."
         ),
     )
     p.add_argument(
@@ -1418,8 +1419,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_RESIDUAL_PCA_COMPONENTS,
         help=(
-            "方案三: 残差 PCA 分量数。在全局参考模板 PCA 之后，对残差向量再做一次 PCA，"
-            "取 top-N 分量作为特征。设为 0 可禁用。"
+            "Approach 3 (residual PCA): number of residual PCA components. After the primary "
+            "global-reference-template PCA, a second SVD is applied to the unexplained residuals "
+            "and the top-N components are added as features. Set to 0 to disable."
         ),
     )
     p.add_argument(
@@ -1427,15 +1429,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=DEFAULT_LEARN_LOT_STATE,
         help=(
-            "方案二: 启用 per-lot 可学习状态向量。对每个 lot 用参考片残差拟合一个 K 维潜变量，"
-            "追加为特征后重新拟合模型。"
+            "Approach 2 (learnable latent state): enable per-lot latent state vectors. "
+            "A K-dim state is fitted per lot from reference-wafer residuals and appended "
+            "as features; the model is then refit on the augmented feature set."
         ),
     )
     p.add_argument(
         "--lot-state-dims",
         type=int,
         default=DEFAULT_LOT_STATE_DIMS,
-        help="方案二: 每个 lot 的潜变量维度 K（需同时设置 --learn-lot-state）。",
+        help="Approach 2 (learnable latent state): dimensionality K of the per-lot state vector (requires --learn-lot-state).",
     )
 
     p.add_argument(
