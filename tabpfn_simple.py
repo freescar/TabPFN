@@ -276,7 +276,7 @@ def build_slot_ref_features(
     5. **Interpolated reference MET** – piecewise-linear interpolation of reference
        METs at the current slot position.
     """
-    slots = df[slot_col].to_numpy()
+    slots = df[slot_col].to_numpy(dtype=np.int32)
     lots = df[lot_col].to_numpy()
     mets = df[target_col].to_numpy(dtype=np.float32)
     n_rows = len(df)
@@ -336,7 +336,7 @@ def build_slot_ref_features(
         if n_ref == 0:
             continue
 
-        lot_ref_slots = slots[lot_ref_mask].astype(int)
+        lot_ref_slots = slots[lot_ref_mask]
         lot_ref_mets = mets[lot_ref_mask]
 
         # slot -> MET dictionary for this lot's reference wafers
@@ -485,7 +485,7 @@ def fit_global_reference_model(
     n_ref = len(ref_ids)
     if n_ref == 0:
         return {
-            "reference_slot_ids": np.array([], dtype=np.float32),
+            "reference_slot_ids": np.array([], dtype=np.int32),
             "slot_fill_values": np.array([], dtype=np.float32),
             "template_profile": np.array([], dtype=np.float32),
             "components": np.empty((0, 0), dtype=np.float32),
@@ -517,7 +517,7 @@ def fit_global_reference_model(
         mat_filled = np.where(np.isnan(mat), slot_fill_values[None, :], mat).astype(np.float32)
         template_profile = np.mean(mat_filled, axis=0).astype(np.float32)
         centered = mat_filled - template_profile[None, :]
-        n_comp = min(max(1, int(n_components)), centered.shape[0], centered.shape[1])
+        n_comp = min(int(n_components), centered.shape[0], centered.shape[1])
         if n_comp <= 0:
             components = np.empty((0, n_ref), dtype=np.float32)
         else:
@@ -528,7 +528,7 @@ def fit_global_reference_model(
                 components = np.empty((0, n_ref), dtype=np.float32)
 
     return {
-        "reference_slot_ids": np.asarray(ref_ids, dtype=np.float32),
+        "reference_slot_ids": np.asarray(ref_ids, dtype=np.int32),
         "slot_fill_values": slot_fill_values,
         "template_profile": template_profile,
         "components": components,
@@ -552,8 +552,8 @@ def append_global_reference_features(
     slot_fill_values = np.asarray(global_ref_model.get("slot_fill_values", np.array([])), dtype=np.float32)
     components = np.asarray(global_ref_model.get("components", np.empty((0, 0))), dtype=np.float32)
     model_ref_ids = np.asarray(
-        global_ref_model.get("reference_slot_ids", np.asarray(reference_slot_ids, dtype=np.float32)),
-        dtype=np.float32,
+        global_ref_model.get("reference_slot_ids", np.asarray(reference_slot_ids, dtype=np.int32)),
+        dtype=np.int32,
     )
 
     if (
@@ -564,7 +564,7 @@ def append_global_reference_features(
         return X_base
 
     X = X_base.copy()
-    slots = df[slot_col].to_numpy(dtype=np.float32)
+    slots = df[slot_col].to_numpy(dtype=np.int32)
     lots = df[lot_col].to_numpy()
     lot_profiles = _build_lot_reference_profiles(
         df,
@@ -581,7 +581,7 @@ def append_global_reference_features(
     template_norm2 = float(np.dot(template_profile, template_profile))
     template_centered = template_profile - float(np.mean(template_profile))
     template_centered_norm = float(np.linalg.norm(template_centered))
-    interp_ref_ids = model_ref_ids
+    interp_ref_ids = model_ref_ids.astype(np.float32)
     interp_template_profile = template_profile
     if len(interp_ref_ids) >= 2:
         sort_idx = np.argsort(interp_ref_ids)
@@ -629,9 +629,7 @@ def append_global_reference_features(
             pc_scores[lot_idx, :] = lot_scores[None, :]
 
         if len(interp_ref_ids) >= 2:
-            global_ref_template_interp[lot_idx] = np.interp(
-                slots[lot_idx], interp_ref_ids, interp_template_profile
-            ).astype(np.float32)
+            global_ref_template_interp[lot_idx] = np.interp(slots[lot_idx], interp_ref_ids, interp_template_profile)
         elif len(interp_ref_ids) == 1:
             global_ref_template_interp[lot_idx] = interp_template_profile[0]
         else:
@@ -645,9 +643,7 @@ def append_global_reference_features(
     X["global_ref_resid_rmse"] = global_ref_resid_rmse
     X["global_ref_template_interp"] = global_ref_template_interp
     if "ref_met_interp" in X.columns:
-        X["global_ref_interp_resid"] = (
-            X["ref_met_interp"].to_numpy(dtype=np.float32) - global_ref_template_interp
-        ).astype(np.float32)
+        X["global_ref_interp_resid"] = X["ref_met_interp"].to_numpy(dtype=np.float32) - global_ref_template_interp
 
     for j in range(n_comp):
         X[f"global_ref_pc{j + 1}"] = pc_scores[:, j]
