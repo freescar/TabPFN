@@ -276,7 +276,7 @@ def build_slot_ref_features(
     5. **Interpolated reference MET** – piecewise-linear interpolation of reference
        METs at the current slot position.
     """
-    slots = df[slot_col].to_numpy()
+    slots = df[slot_col].to_numpy(dtype=np.int32)
     lots = df[lot_col].to_numpy()
     mets = df[target_col].to_numpy(dtype=np.float32)
     n_rows = len(df)
@@ -336,7 +336,7 @@ def build_slot_ref_features(
         if n_ref == 0:
             continue
 
-        lot_ref_slots = slots[lot_ref_mask].astype(int)
+        lot_ref_slots = slots[lot_ref_mask]
         lot_ref_mets = mets[lot_ref_mask]
 
         # slot -> MET dictionary for this lot's reference wafers
@@ -438,6 +438,218 @@ def build_slot_ref_features(
             result[col] = result[col].fillna(col_median)
 
     return result
+
+
+def _build_lot_reference_profiles(
+    df: pd.DataFrame,
+    *,
+    target_col: str,
+    slot_col: str,
+    lot_col: str,
+    reference_slot_ids: list[int],
+) -> dict[object, np.ndarray]:
+    slots = df[slot_col].to_numpy()
+    lots = df[lot_col].to_numpy()
+    mets = df[target_col].to_numpy(dtype=np.float32)
+
+    is_ref = np.isin(slots, reference_slot_ids)
+    ref_ids = list(reference_slot_ids)
+    lot_profiles: dict[object, np.ndarray] = {}
+
+    for lot in np.unique(lots):
+        lot_mask = lots == lot
+        lot_ref_mask = lot_mask & is_ref
+        profile = np.full(len(ref_ids), np.nan, dtype=np.float32)
+        if lot_ref_mask.any():
+            lot_ref_slots = slots[lot_ref_mask].astype(int)
+            lot_ref_mets = mets[lot_ref_mask]
+            for j, sid in enumerate(ref_ids):
+                sid_vals = lot_ref_mets[lot_ref_slots == sid]
+                if len(sid_vals) > 0:
+                    profile[j] = float(np.nanmean(sid_vals))
+        lot_profiles[lot] = profile
+
+    return lot_profiles
+
+
+def fit_global_reference_model(
+    df_train: pd.DataFrame,
+    *,
+    target_col: str,
+    slot_col: str,
+    lot_col: str,
+    reference_slot_ids: list[int],
+    n_components: int = 3,
+) -> dict[str, np.ndarray]:
+    ref_ids = list(reference_slot_ids)
+    n_ref = len(ref_ids)
+    if n_ref == 0:
+        return {
+            "reference_slot_ids": np.array([], dtype=np.int32),
+            "slot_fill_values": np.array([], dtype=np.float32),
+            "template_profile": np.array([], dtype=np.float32),
+            "components": np.empty((0, 0), dtype=np.float32),
+        }
+
+    lot_profiles = _build_lot_reference_profiles(
+        df_train,
+        target_col=target_col,
+        slot_col=slot_col,
+        lot_col=lot_col,
+        reference_slot_ids=ref_ids,
+    )
+    if lot_profiles:
+        mat = np.vstack(list(lot_profiles.values())).astype(np.float32)
+    else:
+        mat = np.empty((0, n_ref), dtype=np.float32)
+
+    if mat.shape[0] == 0:
+        slot_fill_values = np.zeros(n_ref, dtype=np.float32)
+        template_profile = np.zeros(n_ref, dtype=np.float32)
+        components = np.empty((0, n_ref), dtype=np.float32)
+    else:
+        slot_fill_values = np.zeros(n_ref, dtype=np.float32)
+        for j in range(n_ref):
+            col = mat[:, j]
+            valid = col[~np.isnan(col)]
+            if len(valid) > 0:
+                slot_fill_values[j] = float(np.median(valid))
+        mat_filled = np.where(np.isnan(mat), slot_fill_values[None, :], mat).astype(np.float32)
+        template_profile = np.mean(mat_filled, axis=0).astype(np.float32)
+        centered = mat_filled - template_profile[None, :]
+        n_comp = min(int(n_components), centered.shape[0], centered.shape[1])
+        if n_comp <= 0:
+            components = np.empty((0, n_ref), dtype=np.float32)
+        else:
+            try:
+                _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                components = vh[:n_comp].astype(np.float32)
+            except np.linalg.LinAlgError:
+                components = np.empty((0, n_ref), dtype=np.float32)
+
+    return {
+        "reference_slot_ids": np.asarray(ref_ids, dtype=np.int32),
+        "slot_fill_values": slot_fill_values,
+        "template_profile": template_profile,
+        "components": components,
+    }
+
+
+def append_global_reference_features(
+    df: pd.DataFrame,
+    X_base: pd.DataFrame,
+    *,
+    target_col: str,
+    slot_col: str,
+    lot_col: str,
+    reference_slot_ids: list[int],
+    global_ref_model: dict[str, np.ndarray] | None,
+) -> pd.DataFrame:
+    if global_ref_model is None or len(reference_slot_ids) == 0:
+        return X_base
+
+    template_profile = np.asarray(global_ref_model.get("template_profile", np.array([])), dtype=np.float32)
+    slot_fill_values = np.asarray(global_ref_model.get("slot_fill_values", np.array([])), dtype=np.float32)
+    components = np.asarray(global_ref_model.get("components", np.empty((0, 0))), dtype=np.float32)
+    model_ref_ids = np.asarray(
+        global_ref_model.get("reference_slot_ids", np.asarray(reference_slot_ids, dtype=np.int32)),
+        dtype=np.int32,
+    )
+
+    if (
+        len(template_profile) == 0
+        or len(template_profile) != len(reference_slot_ids)
+        or len(slot_fill_values) != len(reference_slot_ids)
+    ):
+        return X_base
+
+    X = X_base.copy()
+    slots = df[slot_col].to_numpy(dtype=np.int32)
+    lots = df[lot_col].to_numpy()
+    lot_profiles = _build_lot_reference_profiles(
+        df,
+        target_col=target_col,
+        slot_col=slot_col,
+        lot_col=lot_col,
+        reference_slot_ids=reference_slot_ids,
+    )
+
+    n_rows = len(df)
+    n_comp = int(components.shape[0]) if components.ndim == 2 else 0
+    eps = 1e-8
+    template_norm = float(np.linalg.norm(template_profile))
+    template_norm2 = float(np.dot(template_profile, template_profile))
+    template_centered = template_profile - float(np.mean(template_profile))
+    template_centered_norm = float(np.linalg.norm(template_centered))
+    interp_ref_ids = model_ref_ids.astype(np.float32)
+    interp_template_profile = template_profile
+    if len(interp_ref_ids) >= 2:
+        sort_idx = np.argsort(interp_ref_ids)
+        interp_ref_ids = interp_ref_ids[sort_idx]
+        interp_template_profile = interp_template_profile[sort_idx]
+
+    global_ref_profile_mean = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_profile_std = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_template_cos = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_template_proj = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_profile_corr = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_resid_rmse = np.full(n_rows, np.nan, dtype=np.float32)
+    global_ref_template_interp = np.full(n_rows, np.nan, dtype=np.float32)
+    pc_scores = np.zeros((n_rows, n_comp), dtype=np.float32)
+
+    for lot in np.unique(lots):
+        lot_mask = lots == lot
+        lot_idx = np.where(lot_mask)[0]
+
+        raw_profile = lot_profiles.get(lot, np.full(len(reference_slot_ids), np.nan, dtype=np.float32))
+        filled_profile = np.where(np.isnan(raw_profile), slot_fill_values, raw_profile).astype(np.float32)
+        centered_profile = filled_profile - template_profile
+
+        profile_norm = float(np.linalg.norm(filled_profile))
+        profile_centered = filled_profile - float(np.mean(filled_profile))
+        profile_centered_norm = float(np.linalg.norm(profile_centered))
+
+        cos_val = float(np.dot(filled_profile, template_profile) / (profile_norm * template_norm + eps))
+        proj_val = float(np.dot(filled_profile, template_profile) / (template_norm2 + eps))
+        corr_val = float(
+            np.dot(profile_centered, template_centered)
+            / (profile_centered_norm * template_centered_norm + eps)
+        )
+        rmse_val = float(np.sqrt(np.mean(centered_profile ** 2)))
+
+        global_ref_profile_mean[lot_idx] = float(np.mean(filled_profile))
+        global_ref_profile_std[lot_idx] = float(np.std(filled_profile))
+        global_ref_template_cos[lot_idx] = cos_val
+        global_ref_template_proj[lot_idx] = proj_val
+        global_ref_profile_corr[lot_idx] = corr_val
+        global_ref_resid_rmse[lot_idx] = rmse_val
+
+        if n_comp > 0:
+            lot_scores = centered_profile @ components.T
+            pc_scores[lot_idx, :] = lot_scores[None, :]
+
+        if len(interp_ref_ids) >= 2:
+            global_ref_template_interp[lot_idx] = np.interp(slots[lot_idx], interp_ref_ids, interp_template_profile)
+        elif len(interp_ref_ids) == 1:
+            global_ref_template_interp[lot_idx] = interp_template_profile[0]
+        else:
+            global_ref_template_interp[lot_idx] = 0.0
+
+    X["global_ref_profile_mean"] = global_ref_profile_mean
+    X["global_ref_profile_std"] = global_ref_profile_std
+    X["global_ref_template_cos"] = global_ref_template_cos
+    X["global_ref_template_proj"] = global_ref_template_proj
+    X["global_ref_profile_corr"] = global_ref_profile_corr
+    X["global_ref_resid_rmse"] = global_ref_resid_rmse
+    X["global_ref_template_interp"] = global_ref_template_interp
+    if "ref_met_interp" in X.columns:
+        X["global_ref_interp_resid"] = X["ref_met_interp"].to_numpy(dtype=np.float32) - global_ref_template_interp
+
+    for j in range(n_comp):
+        X[f"global_ref_pc{j + 1}"] = pc_scores[:, j]
+
+    return X
+
 
 def _coerce_mixed_columns_for_tabpfn(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
@@ -647,6 +859,14 @@ def infer_one_dataset(
     # ── Build slot/reference-MET features (no FDC data used) ─────────────────
     t_prep0 = time.time()
     y = df[target_col].astype(float).to_numpy(dtype=np.float32)
+    train_df = df.iloc[:val_end].copy()
+    global_ref_model = fit_global_reference_model(
+        train_df,
+        target_col=target_col,
+        slot_col=slot_col,
+        lot_col=lot_col,
+        reference_slot_ids=reference_slot_ids,
+    )
 
     X_raw = build_slot_ref_features(
         df,
@@ -654,6 +874,15 @@ def infer_one_dataset(
         slot_col=slot_col,
         lot_col=lot_col,
         reference_slot_ids=reference_slot_ids,
+    )
+    X_raw = append_global_reference_features(
+        df,
+        X_raw,
+        target_col=target_col,
+        slot_col=slot_col,
+        lot_col=lot_col,
+        reference_slot_ids=reference_slot_ids,
+        global_ref_model=global_ref_model,
     )
     X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
 
