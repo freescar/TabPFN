@@ -85,6 +85,7 @@ DEFAULT_LOT_STATE_DIMS = 2             # Approach 2: latent state dimensionality
 DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
 DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
 DEFAULT_CONF_WIDTH_THRESHOLDS = "1.0,2.0,3.0"  # CI 宽度阈值列表 (MET 原始单位)
+DEFAULT_CONF_COVERAGE_LEVELS = (0.1, 0.2, 0.3)  # 依据最小CI宽度选取前10/20/30%
 
 # final_y 等级定义（来自 tabpfn_simple_plus）
 CLASS_LABELS = np.arange(2, 10, dtype=int)
@@ -261,6 +262,41 @@ def eval_class_control_metrics(
         "weighted_penalty": weighted_penalty,
         "control_score": control_score,
     }
+
+
+def eval_final_y_subset_metrics(
+    y_true_cls_raw: np.ndarray,
+    y_pred_cls_raw: np.ndarray,
+    subset_mask: np.ndarray,
+    *,
+    penalty_power: float,
+) -> dict:
+    """Evaluate final_y metrics on an arbitrary boolean subset mask."""
+    subset_mask = np.asarray(subset_mask, dtype=bool)
+    n_samples = int(subset_mask.sum())
+    if n_samples == 0:
+        return {
+            "n_samples": 0,
+            "accuracy": float("nan"),
+            "balanced_accuracy": float("nan"),
+            "macro_f1": float("nan"),
+            "within_1": float("nan"),
+            "within_2": float("nan"),
+            "mae_class": float("nan"),
+            "rmse_class": float("nan"),
+            "mean_signed_diff": float("nan"),
+            "severe_diff_ge2": float("nan"),
+            "extreme_diff_ge3": float("nan"),
+            "weighted_penalty": float("nan"),
+            "control_score": float("nan"),
+        }
+    base = eval_class_control_metrics(
+        y_true_cls=y_true_cls_raw[subset_mask].astype(int),
+        y_pred_cls=y_pred_cls_raw[subset_mask].astype(int),
+        penalty_power=penalty_power,
+    )
+    base["n_samples"] = n_samples
+    return base
 
 
 def per_class_metrics(y_true_cls: np.ndarray, y_pred_cls: np.ndarray) -> pd.DataFrame:
@@ -1539,21 +1575,76 @@ def infer_one_dataset(
         met_to_run_value(y_pred),
         out_of_range=label_out_of_range,
     )
+    ci_width_all = q_upper - q_lower
     valid_final_mask = np.isfinite(y_test_cls_raw) & np.isfinite(y_pred_cls_raw)
     final_eval_mask = test_is_nonref_mask & valid_final_mask
     if final_eval_mask.sum() == 0:
         print(f"  ⚠️ skip {dataset_name}: no valid non-ref rows for final_y evaluation")
         return None
 
-    final_metrics = eval_class_control_metrics(
-        y_true_cls=y_test_cls_raw[final_eval_mask].astype(int),
-        y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
+    final_metrics = eval_final_y_subset_metrics(
+        y_true_cls_raw=y_test_cls_raw,
+        y_pred_cls_raw=y_pred_cls_raw,
+        subset_mask=final_eval_mask,
         penalty_power=diff_penalty_power,
     )
     per_cls = per_class_metrics(
         y_true_cls=y_test_cls_raw[final_eval_mask].astype(int),
         y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
     )
+
+    n_test_nonref = int(test_is_nonref_mask.sum())
+    metrics_final_y_ci_thresholds: dict[str, dict] = {}
+    for thr in conf_width_thresholds:
+        key = f"ci_thr{thr:.1f}"
+        subset_mask = test_is_nonref_mask & (ci_width_all <= thr)
+        subset_eval_mask = subset_mask & valid_final_mask
+        subset_size = int(subset_mask.sum())
+        coverage_pct = float((subset_size / n_test_nonref) * 100.0) if n_test_nonref > 0 else float("nan")
+        subset_metrics = eval_final_y_subset_metrics(
+            y_true_cls_raw=y_test_cls_raw,
+            y_pred_cls_raw=y_pred_cls_raw,
+            subset_mask=subset_eval_mask,
+            penalty_power=diff_penalty_power,
+        )
+        metrics_final_y_ci_thresholds[key] = {
+            "threshold": float(thr),
+            "coverage_pct": coverage_pct,
+            "subset_size": subset_size,
+            "final_eval_size": int(subset_eval_mask.sum()),
+            **subset_metrics,
+        }
+
+    nonref_indices = np.flatnonzero(test_is_nonref_mask)
+    sorted_nonref_indices = nonref_indices[np.argsort(ci_width_all[nonref_indices], kind="stable")]
+    metrics_final_y_coverage: dict[str, dict] = {}
+    for cov in DEFAULT_CONF_COVERAGE_LEVELS:
+        cov_pct = int(round(cov * 100))
+        key = f"cov{cov_pct}"
+        if n_test_nonref > 0:
+            subset_size = int(np.ceil(cov * n_test_nonref))
+            subset_idx = sorted_nonref_indices[:subset_size]
+            subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
+            subset_mask[subset_idx] = True
+            achieved_coverage_pct = float((subset_size / n_test_nonref) * 100.0)
+        else:
+            subset_size = 0
+            subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
+            achieved_coverage_pct = float("nan")
+        subset_eval_mask = subset_mask & valid_final_mask
+        subset_metrics = eval_final_y_subset_metrics(
+            y_true_cls_raw=y_test_cls_raw,
+            y_pred_cls_raw=y_pred_cls_raw,
+            subset_mask=subset_eval_mask,
+            penalty_power=diff_penalty_power,
+        )
+        metrics_final_y_coverage[key] = {
+            "target_coverage_pct": float(cov * 100.0),
+            "achieved_coverage_pct": achieved_coverage_pct,
+            "subset_size": subset_size,
+            "final_eval_size": int(subset_eval_mask.sum()),
+            **subset_metrics,
+        }
 
     t_plot0 = time.time()
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
@@ -1624,6 +1715,8 @@ def infer_one_dataset(
         "time_sec": float(infer_time),
         "metrics_met": metrics,
         "metrics_final_y": final_metrics,
+        "metrics_final_y_ci_thresholds": metrics_final_y_ci_thresholds,
+        "metrics_final_y_coverage": metrics_final_y_coverage,
         "plots": {
             "met_timeseries": plot_path,
             "final_y_timeseries": class_timeseries_path,
@@ -1852,6 +1945,8 @@ def main() -> None:
                 all_results.append(res)
                 m_met = res["metrics_met"]
                 m_final = res["metrics_final_y"]
+                m_final_ci = res.get("metrics_final_y_ci_thresholds", {})
+                m_final_cov = res.get("metrics_final_y_coverage", {})
                 print(
                     f"  MET COMP Non-ref: MAE={m_met['mae']:.4f} R²={m_met['r2']:.4f} "
                     f"Acc@0.5={m_met['acc05']:.1f}% Acc@1.0={m_met['acc10']:.1f}% "
@@ -1875,6 +1970,29 @@ def main() -> None:
                     f"Severe(|d|>=2)={m_final['severe_diff_ge2']:.1f}% "
                     f"Penalty={m_final['weighted_penalty']:.3f} Score={m_final['control_score']:.1f}"
                 )
+                for thr in conf_width_thresholds:
+                    key = f"ci_thr{thr:.1f}"
+                    m_ci = m_final_ci.get(key, {})
+                    print(
+                        f"    final_y CI-width≤{thr:.1f}: coverage={m_ci.get('coverage_pct', float('nan')):.1f}% "
+                        f"n={int(m_ci.get('subset_size', 0))} eval_n={int(m_ci.get('final_eval_size', 0))} "
+                        f"Acc={m_ci.get('accuracy', float('nan')):.1f}% "
+                        f"Within1={m_ci.get('within_1', float('nan')):.1f}% "
+                        f"Severe(|d|>=2)={m_ci.get('severe_diff_ge2', float('nan')):.1f}% "
+                        f"Score={m_ci.get('control_score', float('nan')):.1f}"
+                    )
+                for cov in DEFAULT_CONF_COVERAGE_LEVELS:
+                    cov_pct = int(round(cov * 100))
+                    key = f"cov{cov_pct}"
+                    m_cov = m_final_cov.get(key, {})
+                    print(
+                        f"    final_y top-CI coverage≈{cov_pct}%: achieved={m_cov.get('achieved_coverage_pct', float('nan')):.1f}% "
+                        f"n={int(m_cov.get('subset_size', 0))} eval_n={int(m_cov.get('final_eval_size', 0))} "
+                        f"Acc={m_cov.get('accuracy', float('nan')):.1f}% "
+                        f"Within1={m_cov.get('within_1', float('nan')):.1f}% "
+                        f"Severe(|d|>=2)={m_cov.get('severe_diff_ge2', float('nan')):.1f}% "
+                        f"Score={m_cov.get('control_score', float('nan')):.1f}"
+                    )
                 print(
                     f"  | time={res['time_sec']:.1f}s "
                     f"| features={res['n_features_raw']}->{res['n_features_used']}"
@@ -1928,6 +2046,35 @@ def main() -> None:
                 print(
                     f"  AVG CI-width≤{thr:.1f}: coverage={avg_thr_cov:.1f}% "
                     f"MAE={avg_thr_mae:.4f} Acc@0.5={avg_thr_acc05:.1f}%"
+                )
+            final_valid = [
+                r["metrics_final_y_ci_thresholds"].get(key, {})
+                for r in all_results
+                if not np.isnan(r["metrics_final_y_ci_thresholds"].get(key, {}).get("accuracy", float("nan")))
+            ]
+            if final_valid:
+                avg_final_cov = float(np.mean([m["coverage_pct"] for m in final_valid]))
+                avg_final_acc = float(np.mean([m["accuracy"] for m in final_valid]))
+                avg_final_within1 = float(np.mean([m["within_1"] for m in final_valid]))
+                print(
+                    f"  AVG final_y CI-width≤{thr:.1f}: coverage={avg_final_cov:.1f}% "
+                    f"Acc={avg_final_acc:.1f}% Within1={avg_final_within1:.1f}%"
+                )
+        for cov in DEFAULT_CONF_COVERAGE_LEVELS:
+            cov_pct = int(round(cov * 100))
+            key = f"cov{cov_pct}"
+            valid_cov = [
+                r["metrics_final_y_coverage"].get(key, {})
+                for r in all_results
+                if not np.isnan(r["metrics_final_y_coverage"].get(key, {}).get("accuracy", float("nan")))
+            ]
+            if valid_cov:
+                avg_achieved = float(np.mean([m["achieved_coverage_pct"] for m in valid_cov]))
+                avg_cov_acc = float(np.mean([m["accuracy"] for m in valid_cov]))
+                avg_cov_within1 = float(np.mean([m["within_1"] for m in valid_cov]))
+                print(
+                    f"  AVG final_y top-CI coverage≈{cov_pct}%: achieved={avg_achieved:.1f}% "
+                    f"Acc={avg_cov_acc:.1f}% Within1={avg_cov_within1:.1f}%"
                 )
 
 
