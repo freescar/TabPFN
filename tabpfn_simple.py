@@ -1,5 +1,11 @@
 import os
 os.environ["TABPFN_NO_TELEMETRY"] = "1"
+os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["DISABLE_POSTHOG"] = "1"
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["SEGMENT_WRITE_KEY"] = ""
+os.environ["ANALYTICS_DISABLED"] = "1"
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 import glob
 import time
