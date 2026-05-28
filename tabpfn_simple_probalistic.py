@@ -250,7 +250,7 @@ def final_y_confidence_score(
     *,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """Higher score means more likely final_y within0."""
+    """Higher score means more likely exact final_y hit (|diff| == 0)."""
     y_pred_met = np.asarray(y_pred_met, dtype=np.float32).reshape(-1)
     ci_width_met = np.asarray(ci_width_met, dtype=np.float32).reshape(-1)
     boundary_margin_met = distance_to_run_boundary_met(y_pred_met)
