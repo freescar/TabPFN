@@ -92,6 +92,8 @@ CLASS_LABELS = np.arange(2, 10, dtype=int)
 RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float32)
 DEFAULT_LABEL_OUT_OF_RANGE = "clip"
 DEFAULT_DIFF_PENALTY_POWER = 2.0
+RUN_VALUE_TO_MET_SCALE = 0.1313
+CI_HALF_WIDTH_FACTOR = 0.5
 
 
 # ============================================================
@@ -239,7 +241,7 @@ def distance_to_run_boundary_met(y_pred_met: np.ndarray) -> np.ndarray:
         np.abs(pred_run.reshape(-1, 1) - internal_bounds.reshape(1, -1)),
         axis=1,
     )
-    return dist_run * 0.1313
+    return dist_run * RUN_VALUE_TO_MET_SCALE
 
 
 def final_y_confidence_score(
@@ -252,7 +254,7 @@ def final_y_confidence_score(
     y_pred_met = np.asarray(y_pred_met, dtype=np.float32).reshape(-1)
     ci_width_met = np.asarray(ci_width_met, dtype=np.float32).reshape(-1)
     boundary_margin_met = distance_to_run_boundary_met(y_pred_met)
-    half_width = np.maximum(ci_width_met * 0.5, eps)
+    half_width = np.maximum(ci_width_met * CI_HALF_WIDTH_FACTOR, eps)
     score = boundary_margin_met / half_width
     score = np.where(np.isfinite(score), score, -np.inf).astype(np.float32)
     return score
