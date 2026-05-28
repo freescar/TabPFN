@@ -85,7 +85,7 @@ DEFAULT_LOT_STATE_DIMS = 2             # Approach 2: latent state dimensionality
 DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
 DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
 DEFAULT_CONF_WIDTH_THRESHOLDS = "1.0,2.0,3.0"  # CI 宽度阈值列表 (MET 原始单位)
-DEFAULT_CONF_COVERAGE_LEVELS = (0.1, 0.2, 0.3)  # 依据最小CI宽度选取前10/20/30%
+DEFAULT_CONF_COVERAGE_LEVELS = (0.1, 0.2, 0.3)  # 依据final_y置信分数选取前10/20/30%
 
 # final_y 等级定义（来自 tabpfn_simple_plus）
 CLASS_LABELS = np.arange(2, 10, dtype=int)
@@ -229,6 +229,33 @@ def round_clip_final_y(y_pred_cont: np.ndarray) -> np.ndarray:
     """Convert continuous prediction into valid final_y class labels."""
     y_pred_cont = np.asarray(y_pred_cont, dtype=np.float32)
     return np.clip(np.rint(y_pred_cont), CLASS_LABELS[0], CLASS_LABELS[-1]).astype(int)
+
+
+def distance_to_run_boundary_met(y_pred_met: np.ndarray) -> np.ndarray:
+    """Distance (MET units) from prediction to nearest final_y run boundary."""
+    pred_run = met_to_run_value(np.asarray(y_pred_met, dtype=np.float32).reshape(-1))
+    internal_bounds = RUN_VALUE_BOUNDS[1:-1]
+    dist_run = np.min(
+        np.abs(pred_run.reshape(-1, 1) - internal_bounds.reshape(1, -1)),
+        axis=1,
+    )
+    return dist_run * 0.1313
+
+
+def final_y_confidence_score(
+    y_pred_met: np.ndarray,
+    ci_width_met: np.ndarray,
+    *,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """Higher score means more likely final_y within0."""
+    y_pred_met = np.asarray(y_pred_met, dtype=np.float32).reshape(-1)
+    ci_width_met = np.asarray(ci_width_met, dtype=np.float32).reshape(-1)
+    boundary_margin_met = distance_to_run_boundary_met(y_pred_met)
+    half_width = np.maximum(ci_width_met * 0.5, eps)
+    score = boundary_margin_met / half_width
+    score = np.where(np.isfinite(score), score, -np.inf).astype(np.float32)
+    return score
 
 
 def eval_class_control_metrics(
@@ -1615,8 +1642,12 @@ def infer_one_dataset(
             **subset_metrics,
         }
 
+    boundary_margin_all = distance_to_run_boundary_met(y_pred)
+    confidence_score_all = final_y_confidence_score(y_pred, ci_width_all)
     nonref_indices = np.flatnonzero(test_is_nonref_mask)
-    sorted_nonref_indices = nonref_indices[np.argsort(ci_width_all[nonref_indices], kind="stable")]
+    sorted_nonref_indices = nonref_indices[
+        np.argsort(-confidence_score_all[nonref_indices], kind="stable")
+    ]
     metrics_final_y_coverage: dict[str, dict] = {}
     for cov in DEFAULT_CONF_COVERAGE_LEVELS:
         cov_pct = int(round(cov * 100))
@@ -1643,6 +1674,10 @@ def infer_one_dataset(
             "achieved_coverage_pct": achieved_coverage_pct,
             "subset_size": subset_size,
             "final_eval_size": int(subset_eval_mask.sum()),
+            "ranking_strategy": "margin_over_ci_half_width",
+            "confidence_score_mean": float(np.mean(confidence_score_all[subset_mask])) if subset_size > 0 else float("nan"),
+            "ci_width_mean": float(np.mean(ci_width_all[subset_mask])) if subset_size > 0 else float("nan"),
+            "boundary_margin_met_mean": float(np.mean(boundary_margin_all[subset_mask])) if subset_size > 0 else float("nan"),
             **subset_metrics,
         }
 
@@ -1985,8 +2020,9 @@ def main() -> None:
                     cov_pct = int(round(cov * 100))
                     key = f"cov{cov_pct}"
                     m_cov = m_final_cov.get(key, {})
+                    strategy = m_cov.get("ranking_strategy", "margin_over_ci_half_width")
                     print(
-                        f"    final_y top-CI coverage≈{cov_pct}%: achieved={m_cov.get('achieved_coverage_pct', float('nan')):.1f}% "
+                        f"    final_y top-confidence coverage≈{cov_pct}% ({strategy}): achieved={m_cov.get('achieved_coverage_pct', float('nan')):.1f}% "
                         f"n={int(m_cov.get('subset_size', 0))} eval_n={int(m_cov.get('final_eval_size', 0))} "
                         f"Acc={m_cov.get('accuracy', float('nan')):.1f}% "
                         f"Within1={m_cov.get('within_1', float('nan')):.1f}% "
@@ -2073,7 +2109,7 @@ def main() -> None:
                 avg_cov_acc = float(np.mean([m["accuracy"] for m in valid_cov]))
                 avg_cov_within1 = float(np.mean([m["within_1"] for m in valid_cov]))
                 print(
-                    f"  AVG final_y top-CI coverage≈{cov_pct}%: achieved={avg_achieved:.1f}% "
+                    f"  AVG final_y top-confidence coverage≈{cov_pct}%: achieved={avg_achieved:.1f}% "
                     f"Acc={avg_cov_acc:.1f}% Within1={avg_cov_within1:.1f}%"
                 )
 
