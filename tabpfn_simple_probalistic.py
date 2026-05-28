@@ -1616,13 +1616,13 @@ def infer_one_dataset(
         }
 
     nonref_indices = np.flatnonzero(test_is_nonref_mask)
-    sorted_nonref_indices = nonref_indices[np.argsort(ci_width_all[test_is_nonref_mask], kind="stable")]
+    sorted_nonref_indices = nonref_indices[np.argsort(ci_width_all[nonref_indices], kind="stable")]
     metrics_final_y_coverage: dict[str, dict] = {}
     for cov in DEFAULT_CONF_COVERAGE_LEVELS:
         cov_pct = int(round(cov * 100))
         key = f"cov{cov_pct}"
         if n_test_nonref > 0:
-            subset_size = min(n_test_nonref, int(np.ceil(cov * n_test_nonref)))
+            subset_size = int(np.ceil(cov * n_test_nonref))
             subset_idx = sorted_nonref_indices[:subset_size]
             subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
             subset_mask[subset_idx] = True
