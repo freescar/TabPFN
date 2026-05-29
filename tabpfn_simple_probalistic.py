@@ -45,10 +45,11 @@ warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 # Defaults
 # ============================================================
 
-DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229/EPLBAB01_CHA1_1011_1229.parquet"
-DEFAULT_OUTPUT_DIR = "./results/EPLBAB01_CHA1_1101_1120_simple_fast"
+DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/test/slot_and_r2r.csv"
+# DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229"
+DEFAULT_OUTPUT_DIR = "./results/tmp"
 
-DEFAULT_TARGET_COL = "met"
+DEFAULT_TARGET_COL = 'GroundTruth' # "met"
 DEFAULT_TIME_COL = "start_time"
 DEFAULT_SLOT_COL = "slot_id"
 DEFAULT_LOT_COL = "lot_id"
