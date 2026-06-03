@@ -41,7 +41,6 @@ warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Degrees of freedom")
 warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 
-
 # ============================================================
 # Defaults
 # ============================================================
@@ -93,6 +92,9 @@ DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
 DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
 DEFAULT_CONF_WIDTH_THRESHOLDS = "1.0,2.0,3.0"  # CI 宽度阈值列表 (MET 原始单位)
 DEFAULT_CONF_COVERAGE_LEVELS = (0.1, 0.2, 0.3)  # 依据final_y置信分数选取前10/20/30%
+
+DEFAULT_DROP_LIMIT_MIN = 75  # 参考片量测值下限 (None = 不启用)
+DEFAULT_DROP_LIMIT_MAX = 77  # 参考片量测值上限 (None = 不启用)
 
 # final_y 等级定义（来自 tabpfn_simple_plus）
 CLASS_LABELS = np.arange(2, 10, dtype=int)
@@ -520,11 +522,22 @@ def apply_residual_compensation(
     lot_col: str,
     slot_col: str,
     reference_slot_ids: list[int],
-) -> np.ndarray:
+    *,
+    drop_limit_min: float | None = None,
+    drop_limit_max: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply residual compensation and identify lots to drop based on reference-wafer limits.
+    
+    Returns:
+        compensated: compensated predictions (same shape as y_pred)
+        lot_drop_mask: boolean mask indicating which samples belong to dropped lots
+    """
     compensated = y_pred.copy()
     lots = df_meta[lot_col].values
     slots = df_meta[slot_col].values
     is_ref = np.isin(slots, reference_slot_ids)
+    
+    lot_drop_mask = np.zeros(len(y_pred), dtype=bool)
 
     for lot in np.unique(lots):
         lot_mask = lots == lot
@@ -534,13 +547,27 @@ def apply_residual_compensation(
         if lot_ref_mask.sum() == 0:
             continue
 
+        # Check if this lot's reference wafers exceed limits
+        ref_mets = y_true[lot_ref_mask]
+        ref_mean = np.nanmean(ref_mets)
+        
+        should_drop = False
+        if drop_limit_min is not None and ref_mean < drop_limit_min:
+            should_drop = True
+        if drop_limit_max is not None and ref_mean > drop_limit_max:
+            should_drop = True
+        
+        if should_drop:
+            lot_drop_mask[lot_mask] = True
+            continue  # Skip compensation for dropped lot
+
         bias = np.nanmean(y_true[lot_ref_mask] - y_pred[lot_ref_mask])
         if np.isnan(bias):
             continue
 
         compensated[lot_nonref_mask] += bias
 
-    return compensated
+    return compensated, lot_drop_mask
 
 
 # ============================================================
@@ -1539,6 +1566,8 @@ def infer_one_dataset(
     use_rec_features: bool = DEFAULT_USE_REC_FEATURES,
     rec_pca_components: int = DEFAULT_REC_PCA_COMPONENTS,
     rec_interact_slot: bool = DEFAULT_REC_INTERACT_SLOT,
+    drop_limit_min: float | None = DEFAULT_DROP_LIMIT_MIN,
+    drop_limit_max: float | None = DEFAULT_DROP_LIMIT_MAX,
 ) -> dict | None:
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
@@ -1736,14 +1765,28 @@ def infer_one_dataset(
         }
     )
     y_test = y[val_end:]
-    y_pred = apply_residual_compensation(
+    y_pred, lot_drop_mask = apply_residual_compensation(
         df_meta=meta_test,
         y_true=y_test,
         y_pred=y_pred_raw,
         lot_col=lot_col,
         slot_col=slot_col,
         reference_slot_ids=reference_slot_ids,
+        drop_limit_min=drop_limit_min,
+        drop_limit_max=drop_limit_max,
     )
+    
+    # Apply lot drop mask: exclude dropped lots from prediction
+    valid_lot_mask = ~lot_drop_mask
+    n_dropped_lots = int(np.unique(meta_test[lot_col].values[lot_drop_mask]).size) if lot_drop_mask.any() else 0
+    n_dropped_wafers = int(lot_drop_mask.sum())
+    
+    if drop_limit_min is not None or drop_limit_max is not None:
+        print(
+            f"  drop_limit: min={drop_limit_min} max={drop_limit_max} -> "
+            f"dropped {n_dropped_lots} lots ({n_dropped_wafers} wafers)"
+        )
+    
     # The per-sample bias shift from residual compensation must be applied
     # consistently to the CI bounds so that the interval remains centred on
     # the compensated mean prediction.
@@ -1752,8 +1795,11 @@ def infer_one_dataset(
     q_upper = q_upper_raw + bias_shift
     t_comp = time.time() - t_comp0
 
-    # ── Evaluate (non-ref only) with probability interval metrics ─────────────
-    test_is_nonref_mask = ~test_is_ref
+    # ── Evaluate (non-ref only, excluding dropped lots) with probability interval metrics ─────────────
+    # Modified coverage: predicted wafers / all test wafers (including reference)
+    n_test_all = len(y_test)  # Total test wafers (ref + non-ref)
+    test_is_nonref_mask = ~test_is_ref & valid_lot_mask  # Non-ref and not dropped
+    
     metrics = eval_metrics_prob(
         y_true=y_test[test_is_nonref_mask],
         y_pred=y_pred[test_is_nonref_mask],
@@ -1785,14 +1831,15 @@ def infer_one_dataset(
         y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
     )
 
-    n_test_nonref = int(test_is_nonref_mask.sum())
+    n_test_nonref_predicted = int(test_is_nonref_mask.sum())  # Actually predicted non-ref wafers
     metrics_final_y_ci_thresholds: dict[str, dict] = {}
     for thr in conf_width_thresholds:
         key = f"ci_thr{thr:.1f}"
         subset_mask = test_is_nonref_mask & (ci_width_all <= thr)
         subset_eval_mask = subset_mask & valid_final_mask
         subset_size = int(subset_mask.sum())
-        coverage_pct = float((subset_size / n_test_nonref) * 100.0) if n_test_nonref > 0 else float("nan")
+        # Modified coverage: predicted wafers / all test wafers
+        coverage_pct = float((subset_size / n_test_all) * 100.0) if n_test_all > 0 else float("nan")
         subset_metrics = eval_final_y_subset_metrics(
             y_true_cls_raw=y_test_cls_raw,
             y_pred_cls_raw=y_pred_cls_raw,
@@ -1817,12 +1864,13 @@ def infer_one_dataset(
     for cov in DEFAULT_CONF_COVERAGE_LEVELS:
         cov_pct = int(round(cov * 100))
         key = f"cov{cov_pct}"
-        if n_test_nonref > 0:
-            subset_size = int(np.ceil(cov * n_test_nonref))
+        if n_test_nonref_predicted > 0:
+            subset_size = int(np.ceil(cov * n_test_nonref_predicted))
             subset_idx = sorted_nonref_indices[:subset_size]
             subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
             subset_mask[subset_idx] = True
-            achieved_coverage_pct = float((subset_size / n_test_nonref) * 100.0)
+            # Modified coverage: predicted wafers / all test wafers
+            achieved_coverage_pct = float((subset_size / n_test_all) * 100.0)
         else:
             subset_size = 0
             subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
@@ -1910,7 +1958,11 @@ def infer_one_dataset(
         "n_features_raw": int(fs_info["raw_features"]),
         "n_features_used": int(len(selected_cols)),
         "n_test": int(n_total - val_end),
-        "n_test_nonref": int(test_is_nonref.sum()),
+        "n_test_all": int(n_test_all),  # New: total test wafers
+        "n_test_nonref": int(test_is_nonref.sum()),  # Original non-ref count
+        "n_test_nonref_predicted": int(n_test_nonref_predicted),  # After dropping
+        "n_dropped_lots": int(n_dropped_lots),
+        "n_dropped_wafers": int(n_dropped_wafers),
         "n_test_nonref_final_eval": int(final_eval_mask.sum()),
         "time_sec": float(infer_time),
         "metrics_met": metrics,
@@ -1963,6 +2015,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=DEFAULT_REFERENCE_SLOT_IDS,
         help='Comma-separated slot ids, e.g. "2,3,4,5,12,13,20,21,22,23".',
+    )
+    p.add_argument(
+        "--drop-limit-min",
+        type=float,
+        default=DEFAULT_DROP_LIMIT_MIN,
+        help="Drop lots when reference-wafer mean MET is below this threshold (None = disabled).",
+    )
+    p.add_argument(
+        "--drop-limit-max",
+        type=float,
+        default=DEFAULT_DROP_LIMIT_MAX,
+        help="Drop lots when reference-wafer mean MET is above this threshold (None = disabled).",
     )
 
     p.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
@@ -2169,6 +2233,8 @@ def main() -> None:
                 use_rec_features=args.use_rec_features,
                 rec_pca_components=args.rec_pca_components,
                 rec_interact_slot=args.rec_interact_slot,
+                drop_limit_min=args.drop_limit_min,
+                drop_limit_max=args.drop_limit_max,
             )
             if res is not None:
                 all_results.append(res)
