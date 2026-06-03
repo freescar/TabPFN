@@ -12,6 +12,7 @@ import time
 import gc
 import warnings
 import argparse
+import re
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,11 @@ DEFAULT_TEMPORAL_LOT_WINDOW_K = 5      # Approach 1: temporal drift window size
 DEFAULT_RESIDUAL_PCA_COMPONENTS = 2    # Approach 3: residual PCA component count
 DEFAULT_LEARN_LOT_STATE = False        # Approach 2: enable per-lot latent state vectors
 DEFAULT_LOT_STATE_DIMS = 2             # Approach 2: latent state dimensionality K
+
+# ===== R2R 下货值 (REC) 特征 =====
+DEFAULT_USE_REC_FEATURES = True
+DEFAULT_REC_PCA_COMPONENTS = 4       # 跨站下货值组合的主成分数 (表征进站前状态)
+DEFAULT_REC_INTERACT_SLOT = True     # 下货值 × slot 位置交叉项
 
 # 概率区间 / 置信度阈值
 DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
@@ -884,6 +890,138 @@ def build_temporal_lot_features(
     return result
 
 
+# ============================================================
+# R2R discharge-value (下货值 / *_REC*) feature engineering
+# ============================================================
+
+_REC_PATTERN = re.compile(r"_REC\d+$", re.IGNORECASE)
+
+
+def discover_rec_columns(df: pd.DataFrame, *, exclude_cols: set[str] | None = None) -> list[str]:
+    """Auto-detect R2R discharge-value columns, e.g. '0990.010201_REC4'."""
+    exclude_cols = exclude_cols or set()
+    return [c for c in df.columns if c not in exclude_cols and _REC_PATTERN.search(str(c))]
+
+
+def parse_rec_station(col: str) -> tuple[str, int]:
+    """Split 'oper_no_RECnum' -> (oper_no, num). e.g. '0990.010201_REC4' -> ('0990.010201', 4)."""
+    m = re.match(r"^(.*)_REC(\d+)$", str(col), re.IGNORECASE)
+    if m:
+        return m.group(1), int(m.group(2))
+    return str(col), 0
+
+
+def build_rec_features(
+    df: pd.DataFrame,
+    *,
+    rec_cols: list[str],
+    lot_col: str,
+    slot_col: str,
+    train_end: int,
+    pca_components: int = 4,
+    interaction_with_slot: bool = True,
+) -> pd.DataFrame:
+    """Build features from R2R discharge values (下货值).
+
+    Two complementary roles are captured:
+
+    1. **Direct effect** – raw per-station REC values (``rec_raw__*``) are passed
+       through, plus their cross-products with normalized slot position.
+    2. **Prior-state representation** – cross-station aggregates, per-oper_no
+       aggregates, deviation of the wafer's REC vector from its lot mean, and
+       cross-station PCA scores that compress the full discharge-value profile
+       into a few latent "incoming state" coordinates.
+
+    REC values are control inputs (known before measurement) so they are used for
+    every wafer with no leave-one-out needed.  Standardization and PCA bases are
+    fit on the training slice ``[:train_end]`` only, to remain leakage-clean.
+    """
+    if not rec_cols:
+        return pd.DataFrame(index=df.index)
+
+    rec_mat = df[rec_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    n_rows, n_cols = rec_mat.shape
+    feat: dict[str, np.ndarray] = {}
+
+    # ── 1. Raw pass-through (direct effect on current-station measurement) ────
+    for j, c in enumerate(rec_cols):
+        feat[f"rec_raw__{c}"] = rec_mat[:, j]
+
+    # ── 2. Cross-station row aggregates (combined-state magnitude) ────────────
+    feat["rec_row_mean"] = np.nanmean(rec_mat, axis=1)
+    feat["rec_row_std"] = np.nanstd(rec_mat, axis=1)
+    feat["rec_row_min"] = np.nanmin(rec_mat, axis=1)
+    feat["rec_row_max"] = np.nanmax(rec_mat, axis=1)
+    feat["rec_row_range"] = feat["rec_row_max"] - feat["rec_row_min"]
+    feat["rec_row_median"] = np.nanmedian(rec_mat, axis=1)
+    feat["rec_valid_count"] = np.sum(~np.isnan(rec_mat), axis=1).astype(np.float32)
+
+    # ── 3. Per-station (oper_no) aggregates ──────────────────────────────────
+    station_map: dict[str, list[int]] = {}
+    for j, c in enumerate(rec_cols):
+        st, _ = parse_rec_station(c)
+        station_map.setdefault(st, []).append(j)
+    for st, idxs in station_map.items():
+        sub = rec_mat[:, idxs]
+        safe_st = re.sub(r"[^0-9A-Za-z]+", "_", st).strip("_")
+        feat[f"rec_st_{safe_st}_mean"] = np.nanmean(sub, axis=1)
+        if sub.shape[1] > 1:
+            feat[f"rec_st_{safe_st}_std"] = np.nanstd(sub, axis=1)
+            feat[f"rec_st_{safe_st}_last"] = sub[:, -1]
+            feat[f"rec_st_{safe_st}_delta"] = sub[:, -1] - sub[:, 0]
+
+    # ── 4. Deviation of this wafer's REC vector from its lot mean ─────────────
+    lots = df[lot_col].to_numpy()
+    rec_dev = np.full_like(rec_mat, np.nan)
+    for lot in np.unique(lots):
+        m = lots == lot
+        lot_mean = np.nanmean(rec_mat[m], axis=0)
+        rec_dev[m] = rec_mat[m] - lot_mean[None, :]
+    feat["rec_lot_dev_absmean"] = np.nanmean(np.abs(rec_dev), axis=1)
+    feat["rec_lot_dev_l2"] = np.sqrt(np.nanmean(rec_dev ** 2, axis=1))
+
+    # ── 5. Cross-station PCA (latent incoming-state coordinates) ──────────────
+    if n_cols >= 1 and pca_components > 0:
+        train_mat = rec_mat[:max(train_end, 1)]
+        col_mean = np.nanmean(train_mat, axis=0)
+        col_std = np.nanstd(train_mat, axis=0)
+        col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0).astype(np.float32)
+        col_std = np.where((col_std > 1e-8) & np.isfinite(col_std), col_std, 1.0).astype(np.float32)
+
+        standardized = (np.where(np.isnan(rec_mat), col_mean[None, :], rec_mat) - col_mean[None, :]) / col_std[None, :]
+        n_comp = min(int(pca_components), n_cols, max(1, train_end))
+        try:
+            train_std = standardized[:max(train_end, 1)]
+            train_centered = train_std - np.nanmean(train_std, axis=0, keepdims=True)
+            _, _, vh = np.linalg.svd(np.nan_to_num(train_centered), full_matrices=False)
+            comps = vh[:n_comp]
+            scores = (np.nan_to_num(standardized) @ comps.T).astype(np.float32)
+            for k in range(scores.shape[1]):
+                feat[f"rec_pca{k + 1}"] = scores[:, k]
+        except np.linalg.LinAlgError:
+            pass
+
+    # ── 6. Interaction with slot position (position-dependent direct effect) ──
+    if interaction_with_slot:
+        slots = df[slot_col].to_numpy(dtype=np.float32)
+        slot_min = float(np.nanmin(slots))
+        slot_range = max(float(np.nanmax(slots)) - slot_min, 1.0)
+        slot_norm = ((slots - slot_min) / slot_range).astype(np.float32)
+        feat["rec_row_mean_x_slot"] = feat["rec_row_mean"] * slot_norm
+        if "rec_pca1" in feat:
+            feat["rec_pca1_x_slot"] = feat["rec_pca1"] * slot_norm
+
+    result = pd.DataFrame(feat, index=df.index)
+    result = result.replace([np.inf, -np.inf], np.nan)
+    for col in result.columns:
+        if result[col].isna().any():
+            med = result[col].median()
+            if not np.isfinite(med):
+                med = 0.0
+            result[col] = result[col].fillna(med)
+    return result.astype(np.float32)
+
+
 def _build_lot_reference_profiles(
     df: pd.DataFrame,
     *,
@@ -1398,6 +1536,9 @@ def infer_one_dataset(
     residual_pca_components: int = DEFAULT_RESIDUAL_PCA_COMPONENTS,
     learn_lot_state: bool = DEFAULT_LEARN_LOT_STATE,
     lot_state_dims: int = DEFAULT_LOT_STATE_DIMS,
+    use_rec_features: bool = DEFAULT_USE_REC_FEATURES,
+    rec_pca_components: int = DEFAULT_REC_PCA_COMPONENTS,
+    rec_interact_slot: bool = DEFAULT_REC_INTERACT_SLOT,
 ) -> dict | None:
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
@@ -1474,6 +1615,27 @@ def infer_one_dataset(
             window_k=temporal_lot_window_k,
         )
         X_raw = pd.concat([X_raw, X_temporal], axis=1)
+
+    # R2R discharge values (下货值): direct-effect + prior-state representation
+    if use_rec_features:
+        rec_cols = discover_rec_columns(
+            df,
+            exclude_cols={target_col, time_col, slot_col, lot_col, wafer_id_col},
+        )
+        if rec_cols:
+            X_rec = build_rec_features(
+                df,
+                rec_cols=rec_cols,
+                lot_col=lot_col,
+                slot_col=slot_col,
+                train_end=val_end,
+                pca_components=rec_pca_components,
+                interaction_with_slot=rec_interact_slot,
+            )
+            X_raw = pd.concat([X_raw, X_rec], axis=1)
+            print(f"  REC features: detected {len(rec_cols)} discharge cols -> +{X_rec.shape[1]} features")
+        else:
+            print("  REC features: none detected (no '*_REC*' columns)")
 
     X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
 
@@ -1863,6 +2025,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Approach 2 (learnable latent state): dimensionality K of the per-lot state vector (requires --learn-lot-state).",
     )
 
+    # ── R2R discharge-value (下货值 / *_REC*) features ─────────────────────────
+    p.add_argument(
+        "--no-rec-features",
+        dest="use_rec_features",
+        action="store_false",
+        default=DEFAULT_USE_REC_FEATURES,
+        help="Disable R2R discharge-value (*_REC*) feature engineering.",
+    )
+    p.add_argument(
+        "--rec-pca-components",
+        type=int,
+        default=DEFAULT_REC_PCA_COMPONENTS,
+        help="Number of cross-station PCA components built from discharge values (prior-state representation).",
+    )
+    p.add_argument(
+        "--no-rec-interact-slot",
+        dest="rec_interact_slot",
+        action="store_false",
+        default=DEFAULT_REC_INTERACT_SLOT,
+        help="Disable discharge-value × slot-position cross terms.",
+    )
+
     p.add_argument(
         "--ci-quantile-lower",
         type=float,
@@ -1936,6 +2120,10 @@ def main() -> None:
         "Plus eval enabled: met -> run_value -> final_y classes; report within_1, severe_diff_ge2, "
         "weighted_penalty, control_score."
     )
+    print(
+        f"REC (下货值) features: {'ON' if args.use_rec_features else 'OFF'} | "
+        f"pca_components={args.rec_pca_components} | interact_slot={args.rec_interact_slot}"
+    )
 
     all_results = []
     t_all = time.time()
@@ -1978,6 +2166,9 @@ def main() -> None:
                 residual_pca_components=args.residual_pca_components,
                 learn_lot_state=args.learn_lot_state,
                 lot_state_dims=args.lot_state_dims,
+                use_rec_features=args.use_rec_features,
+                rec_pca_components=args.rec_pca_components,
+                rec_interact_slot=args.rec_interact_slot,
             )
             if res is not None:
                 all_results.append(res)
