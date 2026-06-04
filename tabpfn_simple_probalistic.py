@@ -209,7 +209,13 @@ def met_to_run_value(y: np.ndarray) -> np.ndarray:
 
 
 def run_value_to_met(run_value: np.ndarray) -> np.ndarray:
-    """Convert run_value back to BW09-2 EH MET by business formula."""
+    """Convert run_value back to BW09-2 EH MET by business formula.
+
+    Inverse of ``met_to_run_value``:
+        run_value = (81.0 - met - 0.3127) / 0.1313 - 6.0
+    therefore:
+        met = 79.8995 - 0.1313 * run_value
+    """
     run_value = np.asarray(run_value, dtype=np.float32)
     return 79.8995 - RUN_VALUE_TO_MET_SCALE * run_value
 
@@ -1436,16 +1442,19 @@ def create_model(
 
 def predict_maybe_batched(model: TabPFNClassifier, X: pd.DataFrame, batch_size: int) -> np.ndarray:
     classes = np.asarray(model.classes_)
-    if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
-        proba = model.predict_proba(X)
+
+    def _proba_to_pred_met(proba: np.ndarray) -> np.ndarray:
         pred_loop = classes[np.argmax(proba, axis=1)]
         return final_y_to_met(pred_loop)
+
+    if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
+        proba = model.predict_proba(X)
+        return _proba_to_pred_met(proba)
 
     preds = []
     for i in range(0, len(X), batch_size):
         proba = model.predict_proba(X.iloc[i:i + batch_size])
-        pred_loop = classes[np.argmax(proba, axis=1)]
-        preds.append(final_y_to_met(pred_loop))
+        preds.append(_proba_to_pred_met(proba))
     return np.concatenate(preds)
 
 
@@ -1463,8 +1472,7 @@ def predict_maybe_batched_with_quantiles(
 
     def _predict_batch(batch: pd.DataFrame) -> tuple[np.ndarray, list[np.ndarray]]:
         proba = model.predict_proba(batch)
-        pred_loop = classes[np.argmax(proba, axis=1)]
-        pred_met = final_y_to_met(pred_loop)
+        pred_met = final_y_to_met(classes[np.argmax(proba, axis=1)])
 
         sorted_proba = proba[:, order]
         cdf = np.cumsum(sorted_proba, axis=1)
@@ -1473,6 +1481,8 @@ def predict_maybe_batched_with_quantiles(
             hit = cdf >= float(q)
             q_idx = np.argmax(hit, axis=1)
             no_hit = ~hit.any(axis=1)
+            # Numerical edge case: if row-wise CDF does not cross q due to
+            # floating-point accumulation, fall back to the highest-MET bin.
             q_idx[no_hit] = cdf.shape[1] - 1
             q_arrays.append(sorted_mets[q_idx])
         return pred_met, q_arrays
