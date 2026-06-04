@@ -33,7 +33,7 @@ from sklearn.metrics import (
 )
 from sklearn.feature_selection import f_regression
 
-from tabpfn import TabPFNRegressor
+from tabpfn import TabPFNClassifier
 # import posthog
 # posthog.disabled = True
 
@@ -60,7 +60,7 @@ DEFAULT_REFERENCE_SLOT_IDS = "2,3,4,5,12,13,20,21,22,23"
 DEFAULT_TRAIN_RATIO = 0.7
 DEFAULT_VAL_RATIO = 0.8
 
-DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt"
+DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v3-classifier-v3_default.ckpt"
 
 # ===== 最大提速导向默认值 =====
 DEFAULT_N_ESTIMATORS = 4
@@ -208,6 +208,12 @@ def met_to_run_value(y: np.ndarray) -> np.ndarray:
     return (81.0 - y - 0.3127) / 0.1313 - 6.0
 
 
+def run_value_to_met(run_value: np.ndarray) -> np.ndarray:
+    """Convert run_value back to BW09-2 EH MET by business formula."""
+    run_value = np.asarray(run_value, dtype=np.float32)
+    return 79.8995 - RUN_VALUE_TO_MET_SCALE * run_value
+
+
 def run_value_to_final_y(run_value: np.ndarray, *, out_of_range: str = "clip") -> np.ndarray:
     """Convert run_value to control coefficient final_y in {2, ..., 9}."""
     rv = np.asarray(run_value, dtype=np.float32)
@@ -234,6 +240,16 @@ def met_to_final_y(y: np.ndarray, *, out_of_range: str = "clip") -> tuple[np.nda
     final_y = run_value_to_final_y(run_value, out_of_range=out_of_range)
     n_out = int(((run_value < RUN_VALUE_BOUNDS[0]) | (run_value >= RUN_VALUE_BOUNDS[-1])).sum())
     return final_y, run_value, n_out
+
+
+def final_y_to_met(y_loop: np.ndarray) -> np.ndarray:
+    """Map loop_count/final_y class labels (2~9) to BW09-2 EH MET class centers."""
+    y_loop = np.asarray(y_loop, dtype=np.int64)
+    idx = np.clip(y_loop - CLASS_LABELS[0], 0, len(CLASS_LABELS) - 1)
+    rv_lo = RUN_VALUE_BOUNDS[idx]
+    rv_hi = RUN_VALUE_BOUNDS[idx + 1]
+    rv_center = 0.5 * (rv_lo + rv_hi)
+    return run_value_to_met(rv_center)
 
 
 def round_clip_final_y(y_pred_cont: np.ndarray) -> np.ndarray:
@@ -1399,11 +1415,11 @@ def create_model(
     average_before_softmax: bool,
     poly_features: int,
     subsample_samples: int,
-) -> TabPFNRegressor:
+) -> TabPFNClassifier:
     poly_features = max(1, int(poly_features))
     subsample_samples = max(256, int(subsample_samples))
 
-    return TabPFNRegressor(
+    return TabPFNClassifier(
         model_path=model_path,
         device="cuda",
         n_estimators=n_estimators,
@@ -1418,26 +1434,48 @@ def create_model(
     )
 
 
-def predict_maybe_batched(model: TabPFNRegressor, X: pd.DataFrame, batch_size: int) -> np.ndarray:
+def predict_maybe_batched(model: TabPFNClassifier, X: pd.DataFrame, batch_size: int) -> np.ndarray:
+    classes = np.asarray(model.classes_)
     if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
-        return model.predict(X)
+        proba = model.predict_proba(X)
+        pred_loop = classes[np.argmax(proba, axis=1)]
+        return final_y_to_met(pred_loop)
 
     preds = []
     for i in range(0, len(X), batch_size):
-        preds.append(model.predict(X.iloc[i:i + batch_size]))
+        proba = model.predict_proba(X.iloc[i:i + batch_size])
+        pred_loop = classes[np.argmax(proba, axis=1)]
+        preds.append(final_y_to_met(pred_loop))
     return np.concatenate(preds)
 
 
 def predict_maybe_batched_with_quantiles(
-    model: TabPFNRegressor,
+    model: TabPFNClassifier,
     X: pd.DataFrame,
     batch_size: int,
     ci_quantiles: list[float],
 ) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Return (mean_predictions, [q_lower_array, q_upper_array, ...]) using TabPFN quantile output."""
+    """Return (mapped-MET predictions, [q_lower_array, q_upper_array, ...]) from class posteriors."""
+    classes = np.asarray(model.classes_)
+    class_mets = final_y_to_met(classes)
+    order = np.argsort(class_mets)
+    sorted_mets = class_mets[order]
+
     def _predict_batch(batch: pd.DataFrame) -> tuple[np.ndarray, list[np.ndarray]]:
-        result = model.predict(batch, output_type="main", quantiles=ci_quantiles)
-        return result["mean"], result["quantiles"]
+        proba = model.predict_proba(batch)
+        pred_loop = classes[np.argmax(proba, axis=1)]
+        pred_met = final_y_to_met(pred_loop)
+
+        sorted_proba = proba[:, order]
+        cdf = np.cumsum(sorted_proba, axis=1)
+        q_arrays: list[np.ndarray] = []
+        for q in ci_quantiles:
+            hit = cdf >= float(q)
+            q_idx = np.argmax(hit, axis=1)
+            no_hit = ~hit.any(axis=1)
+            q_idx[no_hit] = cdf.shape[1] - 1
+            q_arrays.append(sorted_mets[q_idx])
+        return pred_met, q_arrays
 
     if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
         return _predict_batch(X)
@@ -1454,7 +1492,7 @@ def predict_maybe_batched_with_quantiles(
 
 
 def fit_lot_latent_states(
-    model: TabPFNRegressor,
+    model: TabPFNClassifier,
     X_selected: pd.DataFrame,
     y: np.ndarray,
     df_meta: pd.DataFrame,
@@ -1490,7 +1528,7 @@ def fit_lot_latent_states(
     n_rows = len(df_meta)
 
     # Predict all rows with the initial model (one pass)
-    preds = model.predict(X_selected)
+    preds = predict_maybe_batched(model, X_selected, batch_size=0)
 
     # Normalise slot positions across the full dataset for consistent basis
     slot_min = float(slots.min())
@@ -1702,7 +1740,20 @@ def infer_one_dataset(
         poly_features=poly_features,
         subsample_samples=subsample_samples,
     )
-    model.fit(X_selected.iloc[:val_end], y[:val_end])
+    y_train_cls = y_final_all[:val_end]
+    train_valid_cls = np.isfinite(y_train_cls)
+    if train_valid_cls.sum() == 0:
+        print(f"  ⚠️ skip {dataset_name}: no valid class labels in train split")
+        return None
+    if train_valid_cls.sum() < len(y_train_cls):
+        print(
+            f"  final_y train labels: drop invalid {int((~train_valid_cls).sum())}/"
+            f"{len(y_train_cls)} rows for classifier fit"
+        )
+    model.fit(
+        X_selected.iloc[:val_end][train_valid_cls],
+        y_train_cls[train_valid_cls].astype(int),
+    )
     t_fit = time.time() - t_fit0
 
     # Approach 2 (learnable latent state): per-lot state vector, optional two-stage refinement ──
@@ -1738,7 +1789,10 @@ def infer_one_dataset(
             poly_features=poly_features,
             subsample_samples=subsample_samples,
         )
-        model.fit(X_selected.iloc[:val_end], y[:val_end])
+        model.fit(
+            X_selected.iloc[:val_end][train_valid_cls],
+            y_train_cls[train_valid_cls].astype(int),
+        )
         t_latent = time.time() - t_latent0
         print(f"  latent-state fit: dims={lot_state_dims} t={t_latent:.2f}s")
 
