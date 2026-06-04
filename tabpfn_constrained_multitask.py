@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +35,8 @@ FB_DC_TARGET1 = 81.0
 PRE_OFFSET = 0.3127
 REC1_GRADIENT = 0.1313
 LOOP_OFFSET = 6.0
+# Run-value interval boundaries that map to loop_count classes 2..9.
+# Unit: run-value in process control formula domain.
 RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float64)
 CLASS_LABELS = np.arange(2, 10, dtype=int)
 LEAKAGE_COLS = ["BW092EH_MET", "rec1_value", "BW092WETEH_MET", "loop_count", "1050.030605_REC1"]
@@ -110,9 +113,13 @@ def discover_rec_columns(df: pd.DataFrame, exclude_cols: set[str]) -> list[str]:
     for c in df.columns:
         if c in exclude_cols:
             continue
-        if pd.api.types.is_numeric_dtype(df[c]) and pd.Series([c]).str.contains(pat, regex=True).iloc[0]:
+        if pd.api.types.is_numeric_dtype(df[c]) and re.search(pat, c):
             cols.append(c)
     return sorted(cols)
+
+
+def quantile_to_z_score(q: float) -> float:
+    return float((math.sqrt(2.0) * torch.special.erfinv(torch.tensor(2.0 * q - 1.0))).item())
 
 
 def robust_spearman(x: np.ndarray, y: np.ndarray) -> float:
@@ -304,7 +311,9 @@ def prepare_labels(df: pd.DataFrame, target_col: str, loop_col: str) -> tuple[np
 
     if loop_col in df.columns:
         loop_raw = pd.to_numeric(df[loop_col], errors="coerce").to_numpy(dtype=np.float64)
-        valid_loop = np.isfinite(loop_raw) & np.isin(loop_raw.astype(int), CLASS_LABELS)
+        finite_mask = np.isfinite(loop_raw)
+        valid_loop = np.zeros_like(finite_mask, dtype=bool)
+        valid_loop[finite_mask] = np.isin(loop_raw[finite_mask].astype(int), CLASS_LABELS)
         y_loop = ocd_to_loop(y_met, out_of_range="clip").astype(int)
         # Prefer provided loop labels when valid; otherwise fall back to formula-derived
         # loops so every row has a stable training target.
@@ -367,8 +376,8 @@ def train_constrained_model(
     lows_np, highs_np = get_loop_met_intervals()
     lows = torch.from_numpy(lows_np.astype(np.float32)).to(device)
     highs = torch.from_numpy(highs_np.astype(np.float32)).to(device)
-    z_lo = float((math.sqrt(2.0) * torch.special.erfinv(torch.tensor(2.0 * ci_q_low - 1.0))).item())
-    z_hi = float((math.sqrt(2.0) * torch.special.erfinv(torch.tensor(2.0 * ci_q_high - 1.0))).item())
+    z_lo = quantile_to_z_score(ci_q_low)
+    z_hi = quantile_to_z_score(ci_q_high)
 
     idx_all = np.arange(X_train.shape[0])
 
@@ -472,7 +481,7 @@ def try_tabpfn_baseline(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser("Constrained multi-task MET/loop trainer")
+    p = argparse.ArgumentParser(description="Constrained multi-task MET/loop trainer")
     p.add_argument("--data-path", required=True)
     p.add_argument("--output-dir", default="./results/constrained_multitask")
     p.add_argument("--target-col", default="BW092EH_MET")
@@ -535,7 +544,7 @@ def main() -> None:
     n = len(df)
     split = int(n * args.train_ratio)
     if split <= 0 or split >= n:
-        raise ValueError("Invalid val-ratio; train/test split is empty")
+        raise ValueError("Invalid train-ratio; train/test split is empty")
 
     X = X_df.to_numpy(dtype=np.float32)
     X_train, X_test = X[:split], X[split:]
