@@ -251,7 +251,8 @@ def met_to_final_y(y: np.ndarray, *, out_of_range: str = "clip") -> tuple[np.nda
 def final_y_to_met(y_loop: np.ndarray) -> np.ndarray:
     """Map loop_count/final_y class labels (2~9) to BW09-2 EH MET class centers."""
     y_loop = np.asarray(y_loop, dtype=np.int64)
-    idx = np.clip(y_loop - CLASS_LABELS[0], 0, len(CLASS_LABELS) - 1)
+    idx = np.searchsorted(CLASS_LABELS, y_loop, side="left")
+    idx = np.clip(idx, 0, len(CLASS_LABELS) - 1)
     rv_lo = RUN_VALUE_BOUNDS[idx]
     rv_hi = RUN_VALUE_BOUNDS[idx + 1]
     rv_center = 0.5 * (rv_lo + rv_hi)
@@ -1482,8 +1483,8 @@ def predict_maybe_batched_with_quantiles(
             q_idx = np.argmax(hit, axis=1)
             no_hit = ~hit.any(axis=1)
             # Numerical edge case: if row-wise CDF does not cross q due to
-            # floating-point accumulation, fall back to the highest-MET bin.
-            q_idx[no_hit] = cdf.shape[1] - 1
+            # floating-point accumulation, fall back to the nearest tail bin.
+            q_idx[no_hit] = 0 if q < 0.5 else (cdf.shape[1] - 1)
             q_arrays.append(sorted_mets[q_idx])
         return pred_met, q_arrays
 
@@ -1538,7 +1539,7 @@ def fit_lot_latent_states(
     n_rows = len(df_meta)
 
     # Predict all rows with the initial model (one pass)
-    preds = predict_maybe_batched(model, X_selected, batch_size=0)
+    preds = predict_maybe_batched(model, X_selected, batch_size=None)
 
     # Normalise slot positions across the full dataset for consistent basis
     slot_min = float(slots.min())
@@ -1757,7 +1758,7 @@ def infer_one_dataset(
         return None
     if train_valid_cls.sum() < len(y_train_cls):
         print(
-            f"  final_y train labels: drop invalid {int((~train_valid_cls).sum())}/"
+            f"  final_y train labels: drop invalid {(~train_valid_cls).sum()}/"
             f"{len(y_train_cls)} rows for classifier fit"
         )
     model.fit(
