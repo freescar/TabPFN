@@ -306,6 +306,8 @@ def prepare_labels(df: pd.DataFrame, target_col: str, loop_col: str) -> tuple[np
         loop_raw = pd.to_numeric(df[loop_col], errors="coerce").to_numpy(dtype=np.float64)
         valid_loop = np.isfinite(loop_raw) & np.isin(loop_raw.astype(int), CLASS_LABELS)
         y_loop = ocd_to_loop(y_met, out_of_range="clip").astype(int)
+        # Prefer provided loop labels when valid; otherwise fall back to formula-derived
+        # loops so every row has a stable training target.
         y_loop[valid_loop] = loop_raw[valid_loop].astype(int)
     else:
         y_loop = ocd_to_loop(y_met, out_of_range="clip").astype(int)
@@ -365,6 +367,8 @@ def train_constrained_model(
     lows_np, highs_np = get_loop_met_intervals()
     lows = torch.from_numpy(lows_np.astype(np.float32)).to(device)
     highs = torch.from_numpy(highs_np.astype(np.float32)).to(device)
+    z_lo = float((math.sqrt(2.0) * torch.special.erfinv(torch.tensor(2.0 * ci_q_low - 1.0))).item())
+    z_hi = float((math.sqrt(2.0) * torch.special.erfinv(torch.tensor(2.0 * ci_q_high - 1.0))).item())
 
     idx_all = np.arange(X_train.shape[0])
 
@@ -424,9 +428,6 @@ def train_constrained_model(
     with torch.no_grad():
         mu_te, log_sigma_te, logits_te = model(Xte)
         sigma_te = torch.exp(log_sigma_te)
-        z_dist = torch.distributions.Normal(torch.tensor(0.0, device=device), torch.tensor(1.0, device=device))
-        z_lo = z_dist.icdf(torch.tensor(ci_q_low, device=device))
-        z_hi = z_dist.icdf(torch.tensor(ci_q_high, device=device))
         q_lo = (mu_te + sigma_te * z_lo).cpu().numpy()
         q_hi = (mu_te + sigma_te * z_hi).cpu().numpy()
 
@@ -454,16 +455,17 @@ def try_tabpfn_baseline(
     y_train_met: np.ndarray,
     X_test: np.ndarray,
     *,
+    device: str,
     ci_q_low: float,
     ci_q_high: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     try:
         from tabpfn import TabPFNRegressor
-    except Exception as exc:  # pragma: no cover
+    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover
         print(f"[WARN] TabPFN not available: {exc}")
         return None
 
-    model = TabPFNRegressor(device="cpu", n_estimators=4, ignore_pretraining_limits=True)
+    model = TabPFNRegressor(device=device, n_estimators=4, ignore_pretraining_limits=True)
     model.fit(pd.DataFrame(X_train), y_train_met)
     out = model.predict(pd.DataFrame(X_test), output_type="main", quantiles=[ci_q_low, ci_q_high])
     return out["mean"], out["quantiles"][0], out["quantiles"][1]
@@ -480,7 +482,7 @@ def main() -> None:
     p.add_argument("--slot-col", default="slot_id")
     p.add_argument("--lot-col", default="lot_id")
     p.add_argument("--wafer-id-col", default="wafer_id")
-    p.add_argument("--val-ratio", type=float, default=0.8)
+    p.add_argument("--train-ratio", type=float, default=0.8)
 
     p.add_argument("--epochs", type=int, default=120)
     p.add_argument("--batch-size", type=int, default=256)
@@ -531,7 +533,7 @@ def main() -> None:
     )
 
     n = len(df)
-    split = int(n * args.val_ratio)
+    split = int(n * args.train_ratio)
     if split <= 0 or split >= n:
         raise ValueError("Invalid val-ratio; train/test split is empty")
 
@@ -607,6 +609,7 @@ def main() -> None:
             X_train,
             y_train_met,
             X_test,
+            device=device,
             ci_q_low=args.ci_quantile_lower,
             ci_q_high=args.ci_quantile_upper,
         )
