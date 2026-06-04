@@ -199,7 +199,7 @@ def build_feature_matrix(
     slot_col: str,
     lot_col: str,
     wafer_id_col: str,
-    post_met_col: str,
+    post_met_col: str | None,   # 允许为 None / 空字符串
     loop_col: str,
 ) -> tuple[pd.DataFrame, list[str]]:
     exclude = {
@@ -207,11 +207,14 @@ def build_feature_matrix(
         time_col,
         lot_col,
         wafer_id_col,
-        post_met_col,
         loop_col,
         "GroundTruth",
         "is_reference",
     }
+    # 仅当确实要用 post-met 且该列存在时才排除它；
+    # 默认场景下 post-met 不存在，脚本照常工作，可使用更多数据。
+    if post_met_col and post_met_col in df.columns:
+        exclude.add(post_met_col)
     exclude.update(LEAKAGE_COLS)
 
     num_cols = [
@@ -368,14 +371,18 @@ def train_constrained_model(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     Xtr = torch.from_numpy(X_train).float().to(device)
-    ytr_met = torch.from_numpy(y_train_met).float().to(device)
+    y_mu = float(np.mean(y_train_met))
+    y_std = float(np.std(y_train_met))
+    if y_std < 1e-8:
+        y_std = 1.0
+    ytr_met = torch.from_numpy((y_train_met - y_mu) / y_std).float().to(device)
     ytr_loop_idx = torch.from_numpy((y_train_loop - CLASS_LABELS[0]).astype(np.int64)).to(device)
 
     Xte = torch.from_numpy(X_test).float().to(device)
 
     lows_np, highs_np = get_loop_met_intervals()
-    lows = torch.from_numpy(lows_np.astype(np.float32)).to(device)
-    highs = torch.from_numpy(highs_np.astype(np.float32)).to(device)
+    lows = torch.from_numpy(((lows_np - y_mu) / y_std).astype(np.float32)).to(device)
+    highs = torch.from_numpy(((highs_np - y_mu) / y_std).astype(np.float32)).to(device)
     z_lo = quantile_to_z_score(ci_q_low)
     z_hi = quantile_to_z_score(ci_q_high)
 
@@ -437,10 +444,10 @@ def train_constrained_model(
     with torch.no_grad():
         mu_te, log_sigma_te, logits_te = model(Xte)
         sigma_te = torch.exp(log_sigma_te)
-        q_lo = (mu_te + sigma_te * z_lo).cpu().numpy()
-        q_hi = (mu_te + sigma_te * z_hi).cpu().numpy()
+        pred_met = (mu_te * y_std + y_mu).cpu().numpy()
+        q_lo = ((mu_te + sigma_te * z_lo) * y_std + y_mu).cpu().numpy()
+        q_hi = ((mu_te + sigma_te * z_hi) * y_std + y_mu).cpu().numpy()
 
-        pred_met = mu_te.cpu().numpy()
         pred_loop = (torch.argmax(logits_te, dim=1) + CLASS_LABELS[0]).cpu().numpy()
 
     train_info = {
@@ -483,10 +490,13 @@ def try_tabpfn_baseline(
 def main() -> None:
     p = argparse.ArgumentParser(description="Constrained multi-task MET/loop trainer")
     p.add_argument("--data-path", required=True)
-    p.add_argument("--output-dir", default="./results/constrained_multitask")
+    p.add_argument("--output-dir", default="./results/tmp")
     p.add_argument("--target-col", default="BW092EH_MET")
     p.add_argument("--loop-col", default="loop_count")
-    p.add_argument("--post-met-col", default="BW092WETEH_MET")
+    p.add_argument("--post-met-col", default="") #BW092WETEH_MET 默认空：不依赖 post-met
+    p.add_argument("--use-post-met", action="store_true", default=False,
+                   help="存在 post-met 列且希望将其作为泄漏列排除时才开启；"
+                        "默认不使用 post-met，可使用更多未匹配 post-met 的数据")
     p.add_argument("--time-col", default="start_time")
     p.add_argument("--slot-col", default="slot_id")
     p.add_argument("--lot-col", default="lot_id")
@@ -530,6 +540,7 @@ def main() -> None:
         df = df.reset_index(drop=True)
 
     y_met, y_loop = prepare_labels(df, args.target_col, args.loop_col)
+    post_met = args.post_met_col if (args.use_post_met and args.post_met_col) else None
     X_df, feature_names = build_feature_matrix(
         df,
         target_col=args.target_col,
@@ -537,7 +548,7 @@ def main() -> None:
         slot_col=args.slot_col,
         lot_col=args.lot_col,
         wafer_id_col=args.wafer_id_col,
-        post_met_col=args.post_met_col,
+        post_met_col=post_met,
         loop_col=args.loop_col,
     )
 
