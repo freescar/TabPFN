@@ -45,11 +45,11 @@ warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 # Defaults
 # ============================================================
 
-DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/test/slot_and_r2r.csv"
+DEFAULT_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Tool06_CHA.csv"
 # DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229"
 DEFAULT_OUTPUT_DIR = "./results/tmp"
 
-DEFAULT_TARGET_COL = 'GroundTruth' # "met"
+DEFAULT_TARGET_COL = "GroundTruth" # 'GroundTruth' # "met"
 DEFAULT_TIME_COL = "start_time"
 DEFAULT_SLOT_COL = "slot_id"
 DEFAULT_LOT_COL = "lot_id"
@@ -60,7 +60,7 @@ DEFAULT_REFERENCE_SLOT_IDS = "2,3,4,5,12,13,20,21,22,23"
 DEFAULT_TRAIN_RATIO = 0.7
 DEFAULT_VAL_RATIO = 0.8
 
-DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v2.5-regressor-v2.5_default.ckpt"
+DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt"
 
 # ===== 最大提速导向默认值 =====
 DEFAULT_N_ESTIMATORS = 4
