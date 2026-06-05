@@ -16,7 +16,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, mean_absolute_error, mean_squared_error
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score
 
 from tabpfn import TabPFNClassifier
 
@@ -51,6 +51,23 @@ def run_value_to_loop(rv, out_of_range="clip"):
 def ocd_to_loop(ocd, out_of_range="clip"):
     """从 OCD (GroundTruth) 计算 loop_count"""
     return run_value_to_loop(ocd_to_run_value(ocd), out_of_range=out_of_range)
+
+
+def loop_to_ocd(loop_count: np.ndarray) -> np.ndarray:
+    """将 loop_count 整数类别转换为代表性 OCD (met) 值（使用各区间中点）。"""
+    loop_count = np.asarray(loop_count, dtype=int)
+    # 各 loop_count 对应的 run_value 区间中点
+    midpoints = np.array(
+        [(RUN_VALUE_BOUNDS[i] + RUN_VALUE_BOUNDS[i + 1]) / 2.0 for i in range(len(CLASS_LABELS))],
+        dtype=np.float64,
+    )
+    rv_mid = np.zeros(len(loop_count), dtype=np.float64)
+    for i, label in enumerate(CLASS_LABELS):
+        rv_mid[loop_count == label] = midpoints[i]
+    # run_value = (FB_DC_TARGET1 - ocd - PRE_OFFSET) / REC1_GRADIENT - LOOP_OFFSET
+    # => ocd = FB_DC_TARGET1 - PRE_OFFSET - (rv + LOOP_OFFSET) * REC1_GRADIENT
+    ocd = FB_DC_TARGET1 - PRE_OFFSET - (rv_mid + LOOP_OFFSET) * REC1_GRADIENT
+    return ocd.astype(np.float32)
 
 
 def force_cleanup() -> None:
@@ -579,6 +596,44 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"[OUT] {summary_path}")
     print(f"[OUT] {pred_path}")
+
+    # ----------------------------------------------------------------
+    # 交叉评估：将 loop_count 预测结果转换为 met (OCD) 值，评估 met 预测精度
+    # (仅在 target_col='GroundTruth' 时有真实 OCD 值可供对比)
+    # ----------------------------------------------------------------
+    if use_ground_truth:
+        y_test_ocd = ground_truth_vals[split:][eval_mask].astype(np.float32)
+        y_pred_ocd = loop_to_ocd(y_pred[eval_mask])
+        ci_w_eval = ci_width[eval_mask]
+
+        n_eval = len(y_test_ocd)
+        abs_err = np.abs(y_test_ocd - y_pred_ocd)
+        mae_cross = float(mean_absolute_error(y_test_ocd, y_pred_ocd))
+        r2_cross = float(r2_score(y_test_ocd, y_pred_ocd))
+        acc05_cross = float(np.mean(abs_err <= 0.5) * 100.0)
+        acc10_cross = float(np.mean(abs_err <= 1.0) * 100.0)
+
+        print(
+            f"[CROSS-EVAL met/OCD] n={n_eval} MAE={mae_cross:.4f} R2={r2_cross:.4f} "
+            f"Acc@0.5={acc05_cross:.2f}% Acc@1.0={acc10_cross:.2f}%"
+        )
+        for thr in conf_width_thresholds:
+            high_conf = ci_w_eval <= thr
+            n_hc = int(high_conf.sum())
+            cov_pct = float(np.mean(high_conf) * 100.0)
+            if n_hc > 0:
+                hc_err = np.abs(y_test_ocd[high_conf] - y_pred_ocd[high_conf])
+                mae_hc = float(mean_absolute_error(y_test_ocd[high_conf], y_pred_ocd[high_conf]))
+                r2_hc = float(r2_score(y_test_ocd[high_conf], y_pred_ocd[high_conf]))
+                acc05_hc = float(np.mean(hc_err <= 0.5) * 100.0)
+                acc10_hc = float(np.mean(hc_err <= 1.0) * 100.0)
+                print(
+                    f"  CI<= {thr:.1f}: coverage={cov_pct:.2f}% n={n_hc} "
+                    f"MAE={mae_hc:.4f} R2={r2_hc:.4f} "
+                    f"Acc@0.5={acc05_hc:.2f}% Acc@1.0={acc10_hc:.2f}%"
+                )
+            else:
+                print(f"  CI<= {thr:.1f}: coverage={cov_pct:.2f}% n=0 (no high-confidence samples)")
 
     del model
     force_cleanup()
