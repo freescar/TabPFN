@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import os
-os.environ.setdefault("TABPFN_NO_TELEMETRY", "1")
-os.environ.setdefault("DO_NOT_TRACK", "1")
-os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ["TABPFN_NO_TELEMETRY"] = "1"
+os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["DISABLE_POSTHOG"] = "1"
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["SEGMENT_WRITE_KEY"] = ""
+os.environ["ANALYTICS_DISABLED"] = "1"
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 import argparse
 import gc
@@ -15,6 +19,38 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 
 from tabpfn import TabPFNClassifier
+
+
+# ============================================================
+# 业务公式 (参考 tabpfn_simple_probalistic_loop.py)
+# ============================================================
+FB_DC_TARGET1 = 81.0
+PRE_OFFSET = 0.3127
+REC1_GRADIENT = 0.1313
+LOOP_OFFSET = 6.0
+
+RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float64)
+CLASS_LABELS = np.arange(2, 10, dtype=int)
+
+
+def ocd_to_run_value(ocd):
+    """将 OCD 值转换为 run_value"""
+    return (FB_DC_TARGET1 - np.asarray(ocd, dtype=np.float64) - PRE_OFFSET) / REC1_GRADIENT - LOOP_OFFSET
+
+
+def run_value_to_loop(rv, out_of_range="clip"):
+    """将 run_value 转换为 loop_count"""
+    rv = np.asarray(rv, dtype=np.float64)
+    idx = np.searchsorted(RUN_VALUE_BOUNDS[1:-1], rv, side="right")
+    loop = CLASS_LABELS[np.clip(idx, 0, len(CLASS_LABELS) - 1)].astype(float)
+    if out_of_range == "nan":
+        loop[~((rv >= RUN_VALUE_BOUNDS[0]) & (rv < RUN_VALUE_BOUNDS[-1]))] = np.nan
+    return loop
+
+
+def ocd_to_loop(ocd, out_of_range="clip"):
+    """从 OCD (GroundTruth) 计算 loop_count"""
+    return run_value_to_loop(ocd_to_run_value(ocd), out_of_range=out_of_range)
 
 
 def force_cleanup() -> None:
@@ -319,6 +355,22 @@ def run(args: argparse.Namespace) -> None:
         if required not in df.columns:
             raise ValueError(f"Missing required column: {required}")
 
+    # 如果 target_col 是 'GroundTruth'，则计算 loop_count
+    use_ground_truth = (args.target_col == 'GroundTruth')
+    if use_ground_truth:
+        print(f"[INFO] Detected target_col='GroundTruth', computing loop_count from OCD values...")
+        ground_truth_vals = pd.to_numeric(df[args.target_col], errors="coerce").to_numpy(dtype=np.float64)
+        if not np.all(np.isfinite(ground_truth_vals)):
+            raise ValueError(f"Target column {args.target_col} contains NaN or inf")
+        # 计算 loop_count
+        df['loop_count'] = ocd_to_loop(ground_truth_vals, out_of_range="clip").astype(int)
+        print(f"[INFO] Computed loop_count from GroundTruth. Distribution:")
+        print(df['loop_count'].value_counts().sort_index())
+        # 使用计算出的 loop_count 作为目标
+        actual_target_col = 'loop_count'
+    else:
+        actual_target_col = args.target_col
+
     if args.use_reference_slot_features and args.lot_col not in df.columns:
         if args.wafer_id_col in df.columns:
             df[args.lot_col] = df[args.wafer_id_col].astype(str).str[:-2]
@@ -330,25 +382,32 @@ def run(args: argparse.Namespace) -> None:
     if split <= 0 or split >= n:
         raise ValueError(f"Invalid split by val-ratio={args.val_ratio}, n={n}")
 
-    y_raw = pd.to_numeric(df[args.target_col], errors="coerce").to_numpy(dtype=np.float32)
+    y_raw = pd.to_numeric(df[actual_target_col], errors="coerce").to_numpy(dtype=np.float32)
     valid_target = np.isfinite(y_raw)
     if not np.all(valid_target):
-        raise ValueError(f"Target column {args.target_col} contains NaN or inf")
+        raise ValueError(f"Target column {actual_target_col} contains NaN or inf")
 
     y = np.rint(y_raw).astype(int)
 
+    # 构建排除列集合，如果使用 GroundTruth，则排除它
     exclude_cols = {
-        args.target_col,
+        actual_target_col,
         args.time_col,
         args.slot_col,
         args.lot_col,
         args.wafer_id_col,
     }
+    if use_ground_truth:
+        exclude_cols.add('GroundTruth')
+        print(f"[INFO] Excluding 'GroundTruth' from features during training/inference")
 
     if args.use_reference_slot_features:
+        # 使用实际的目标列（计算出的 loop_count 或原始 target_col）进行参考片特征工程
+        # 但如果是 GroundTruth，我们需要用 GroundTruth 的值来计算参考片统计
+        ref_target_col = args.target_col if use_ground_truth else actual_target_col
         X = build_slot_ref_features(
             df,
-            target_col=args.target_col,
+            target_col=ref_target_col,
             slot_col=args.slot_col,
             lot_col=args.lot_col,
             reference_slot_ids=ref_slots,
@@ -459,6 +518,10 @@ def run(args: argparse.Namespace) -> None:
         pred_df[args.lot_col] = df[args.lot_col].to_numpy()[split:]
     if args.slot_col in df.columns:
         pred_df[args.slot_col] = test_slots
+    
+    # 如果使用了 GroundTruth，也保存原始 OCD 值供参考
+    if use_ground_truth:
+        pred_df['ground_truth_ocd'] = df[args.target_col].to_numpy()[split:]
 
     pred_path = os.path.join(args.output_dir, "loop_count_test_predictions.csv")
     pred_df.to_csv(pred_path, index=False)
@@ -469,6 +532,7 @@ def run(args: argparse.Namespace) -> None:
         "n_test": int(n - split),
         "n_features": int(X.shape[1]),
         "use_reference_slot_features": bool(args.use_reference_slot_features),
+        "computed_from_ground_truth": bool(use_ground_truth),
         **{f"full_{k}": v for k, v in full_metrics.items()},
     }
     summary_path = os.path.join(args.output_dir, "loop_count_summary_metrics.csv")
@@ -486,6 +550,8 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"[INFO] rows={n} train={split} test={n-split}")
     print(f"[INFO] features={X.shape[1]} use_reference_slot_features={args.use_reference_slot_features}")
+    if use_ground_truth:
+        print(f"[INFO] loop_count computed from GroundTruth (OCD values)")
     print(
         f"[FULL] Acc={full_metrics['accuracy']:.2f}% BalancedAcc={full_metrics['balanced_accuracy']:.2f}% "
         f"MacroF1={full_metrics['macro_f1']:.2f}% Within1={full_metrics['within_1']:.2f}% "
@@ -525,7 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-path", type=str, default="/ossfs/workspace/tools/A2_DBJOA_BW09_Tool06_CHA.csv")
     p.add_argument("--output-dir", type=str, default="./results/baseline_loop_count_classifier")
 
-    p.add_argument("--target-col", type=str, default="loop_count")
+    p.add_argument("--target-col", type=str, default="loop_count",
+                   help="Target column name. Use 'GroundTruth' to compute loop_count from OCD values, or 'loop_count' to use directly.")
     p.add_argument("--time-col", type=str, default="start_time")
     p.add_argument("--slot-col", type=str, default="slot_id")
     p.add_argument("--lot-col", type=str, default="lot_id")
@@ -536,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model-path",
         type=str,
-        default="./tabpfn-v3-classifier-v3_20260417_multiclass.ckpt",
+        default="./models/tabpfn-v3-classifier-v3_20260417_multiclass.ckpt",
     )
     p.add_argument("--n-estimators", type=int, default=4)
     p.add_argument("--softmax-temperature", type=float, default=0.9)
