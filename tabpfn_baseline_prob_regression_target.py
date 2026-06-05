@@ -21,6 +21,28 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from tabpfn import TabPFNRegressor
 
 
+# ============================================================
+# 业务公式：OCD (met) <-> loop_count 互转
+# ============================================================
+_FB_DC_TARGET1 = 81.0
+_PRE_OFFSET = 0.3127
+_REC1_GRADIENT = 0.1313
+_LOOP_OFFSET = 6.0
+_RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float64)
+_CLASS_LABELS = np.arange(2, 10, dtype=int)
+
+
+def ocd_to_loop(ocd: np.ndarray, out_of_range: str = "clip") -> np.ndarray:
+    """将 OCD (GroundTruth/met) 值转换为 loop_count 整数类别。"""
+    ocd = np.asarray(ocd, dtype=np.float64)
+    rv = (_FB_DC_TARGET1 - ocd - _PRE_OFFSET) / _REC1_GRADIENT - _LOOP_OFFSET
+    idx = np.searchsorted(_RUN_VALUE_BOUNDS[1:-1], rv, side="right")
+    loop = _CLASS_LABELS[np.clip(idx, 0, len(_CLASS_LABELS) - 1)].astype(float)
+    if out_of_range == "nan":
+        loop[~((rv >= _RUN_VALUE_BOUNDS[0]) & (rv < _RUN_VALUE_BOUNDS[-1]))] = np.nan
+    return loop
+
+
 def acc_within(y_true: np.ndarray, y_pred: np.ndarray, thr: float) -> float:
     return float(np.mean(np.abs(y_true - y_pred) <= thr) * 100.0)
 
@@ -59,6 +81,7 @@ def eval_metrics_prob(
         coverage_pct = float(np.mean(high_conf) * 100.0)
         key_prefix = f"ci_thr{thr:.1f}"
         base[f"{key_prefix}_coverage_pct"] = coverage_pct
+        base[f"{key_prefix}_n_samples"] = int(high_conf.sum())
         if high_conf.sum() > 0:
             base[f"{key_prefix}_mae"] = float(mean_absolute_error(y_true[high_conf], y_pred[high_conf]))
             base[f"{key_prefix}_r2"] = float(r2_score(y_true[high_conf], y_pred[high_conf]))
@@ -463,12 +486,52 @@ def run(args: argparse.Namespace) -> None:
     for thr in conf_width_thresholds:
         key = f"ci_thr{thr:.1f}"
         print(
-            f"  CI<= {thr:.1f}: coverage={metrics[f'{key}_coverage_pct']:.2f}% "
+            f"  CI<= {thr:.1f}: coverage={metrics[f'{key}_coverage_pct']:.2f}% n={metrics[f'{key}_n_samples']} "
             f"MAE={metrics[f'{key}_mae']:.4f} R2={metrics[f'{key}_r2']:.4f} "
             f"Acc@0.5={metrics[f'{key}_acc05']:.2f}% Acc@1.0={metrics[f'{key}_acc10']:.2f}%"
         )
     print(f"[OUT] {summary_path}")
     print(f"[OUT] {pred_path}")
+
+    # ----------------------------------------------------------------
+    # 交叉评估：将 met 预测结果转换为 loop_count，评估 loop_count 推荐精度
+    # ----------------------------------------------------------------
+    y_true_eval = y_test[eval_mask]
+    y_pred_eval = y_pred[eval_mask]
+    ci_w_eval = (q_upper - q_lower)[eval_mask]
+
+    loop_true = ocd_to_loop(y_true_eval).astype(int)
+    loop_pred = ocd_to_loop(y_pred_eval).astype(int)
+    loop_diff = np.abs(loop_pred - loop_true)
+
+    n_eval = len(loop_true)
+    loop_acc = float(np.mean(loop_pred == loop_true) * 100.0)
+    loop_w1 = float(np.mean(loop_diff <= 1) * 100.0)
+    loop_w2 = float(np.mean(loop_diff <= 2) * 100.0)
+    loop_severe = float(np.mean(loop_diff >= 2) * 100.0)
+    loop_mae = float(np.mean(loop_diff.astype(float)))
+
+    print(
+        f"[CROSS-EVAL loop_count] n={n_eval} Acc={loop_acc:.2f}% Within1={loop_w1:.2f}% "
+        f"Within2={loop_w2:.2f}% Severe(|d|>=2)={loop_severe:.2f}% MAE={loop_mae:.4f}"
+    )
+    for thr in conf_width_thresholds:
+        high_conf = ci_w_eval <= thr
+        n_hc = int(high_conf.sum())
+        cov_pct = float(np.mean(high_conf) * 100.0)
+        if n_hc > 0:
+            hc_diff = np.abs(loop_pred[high_conf] - loop_true[high_conf])
+            hc_acc = float(np.mean(loop_pred[high_conf] == loop_true[high_conf]) * 100.0)
+            hc_w1 = float(np.mean(hc_diff <= 1) * 100.0)
+            hc_severe = float(np.mean(hc_diff >= 2) * 100.0)
+            hc_mae = float(np.mean(hc_diff.astype(float)))
+            print(
+                f"  CI<= {thr:.1f}: coverage={cov_pct:.2f}% n={n_hc} "
+                f"Acc={hc_acc:.2f}% Within1={hc_w1:.2f}% "
+                f"Severe(|d|>=2)={hc_severe:.2f}% MAE={hc_mae:.4f}"
+            )
+        else:
+            print(f"  CI<= {thr:.1f}: coverage={cov_pct:.2f}% n=0 (no high-confidence samples)")
 
     del model
     force_cleanup()
