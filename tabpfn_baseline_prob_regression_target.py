@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import os
-os.environ.setdefault("TABPFN_NO_TELEMETRY", "1")
-os.environ.setdefault("DO_NOT_TRACK", "1")
-os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ["TABPFN_NO_TELEMETRY"] = "1"
+os.environ["POSTHOG_DISABLED"] = "1"
+os.environ["DISABLE_POSTHOG"] = "1"
+os.environ["DO_NOT_TRACK"] = "1"
+os.environ["SEGMENT_WRITE_KEY"] = ""
+os.environ["ANALYTICS_DISABLED"] = "1"
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 import argparse
 import gc
@@ -488,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model-path",
         type=str,
-        default="./tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt",
+        default="./models/tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt",
     )
     p.add_argument("--n-estimators", type=int, default=4)
     p.add_argument("--softmax-temperature", type=float, default=0.9)
