@@ -144,6 +144,7 @@ def train_catboost_model(
         subsample=0.8,
         random_seed=seed,
         verbose=100,
+        loss_function='RMSE',
         eval_metric="MAE",
         early_stopping_rounds=50,
     )
