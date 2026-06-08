@@ -54,6 +54,10 @@ def train_catboost_model(
     os.makedirs(output_dir, exist_ok=True)
 
     df = load_data(data_path)
+    # 检查是否有时间列
+    if 'start_time' in df.columns:
+        df = df.sort_values('start_time').reset_index(drop=True)
+        print(f"[INFO] Data sorted by start_time")
     print(f"\n{'='*80}")
     print(f"[DATA LOADING]")
     print(f"{'='*80}")
