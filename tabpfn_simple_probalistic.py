@@ -12,7 +12,6 @@ import time
 import gc
 import warnings
 import argparse
-import re
 
 import numpy as np
 import pandas as pd
@@ -22,18 +21,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
+from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.feature_selection import f_regression
 
-from tabpfn import TabPFNClassifier
+from tabpfn import TabPFNRegressor
 # import posthog
 # posthog.disabled = True
 
@@ -41,15 +32,19 @@ warnings.filterwarnings("ignore", message="All-NaN slice encountered")
 warnings.filterwarnings("ignore", message="Degrees of freedom")
 warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 
+
 # ============================================================
 # Defaults
 # ============================================================
 
-DEFAULT_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Tool06_CHA.csv"
-# DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229"
+# DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229/EPLBAB01_CHA1_1011_1229.parquet"
+# DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/WideTable-fdc_met_bw09_1011_1229/"
+# DEFAULT_DATA_PATH = "/ossfs/workspace/xrfm/TabPFN-main/datasets/test/slot_and_r2r.csv"
+# DEFAULT_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/A2_DBJOA_BW09_Simple_Tabpfn_Tool06_CHA1.csv"
+DEFAULT_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/"
 DEFAULT_OUTPUT_DIR = "./results/tmp"
 
-DEFAULT_TARGET_COL = "GroundTruth" # 'GroundTruth' # "met"
+DEFAULT_TARGET_COL = 'GroundTruth' # "met"
 DEFAULT_TIME_COL = "start_time"
 DEFAULT_SLOT_COL = "slot_id"
 DEFAULT_LOT_COL = "lot_id"
@@ -57,10 +52,10 @@ DEFAULT_WAFER_ID_COL = "wafer_id"
 
 DEFAULT_REFERENCE_SLOT_IDS = "2,3,4,5,12,13,20,21,22,23"
 
-DEFAULT_TRAIN_RATIO = 0.7
-DEFAULT_VAL_RATIO = 0.8
+DEFAULT_TRAIN_RATIO = 0.8
+DEFAULT_VAL_RATIO = 0.9
 
-DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v3-classifier-v3_default.ckpt"
+DEFAULT_MODEL_PATH = "/ossfs/workspace/xrfm/TabPFN-main/models/tabpfn-v3-regressor-v3_20260417_mediumdata.ckpt"
 
 # ===== 最大提速导向默认值 =====
 DEFAULT_N_ESTIMATORS = 4
@@ -82,27 +77,10 @@ DEFAULT_RESIDUAL_PCA_COMPONENTS = 2    # Approach 3: residual PCA component coun
 DEFAULT_LEARN_LOT_STATE = False        # Approach 2: enable per-lot latent state vectors
 DEFAULT_LOT_STATE_DIMS = 2             # Approach 2: latent state dimensionality K
 
-# ===== R2R 下货值 (REC) 特征 =====
-DEFAULT_USE_REC_FEATURES = True
-DEFAULT_REC_PCA_COMPONENTS = 4       # 跨站下货值组合的主成分数 (表征进站前状态)
-DEFAULT_REC_INTERACT_SLOT = True     # 下货值 × slot 位置交叉项
-
 # 概率区间 / 置信度阈值
-DEFAULT_CI_QUANTILE_LOWER = 0.1   # 80% 预测区间下界分位数
-DEFAULT_CI_QUANTILE_UPPER = 0.9   # 80% 预测区间上界分位数
-DEFAULT_CONF_WIDTH_THRESHOLDS = "1.0,2.0,3.0"  # CI 宽度阈值列表 (MET 原始单位)
-DEFAULT_CONF_COVERAGE_LEVELS = (0.1, 0.2, 0.3)  # 依据final_y置信分数选取前10/20/30%
-
-DEFAULT_DROP_LIMIT_MIN = 75  # 参考片量测值下限 (None = 不启用)
-DEFAULT_DROP_LIMIT_MAX = 77  # 参考片量测值上限 (None = 不启用)
-
-# final_y 等级定义（来自 tabpfn_simple_plus）
-CLASS_LABELS = np.arange(2, 10, dtype=int)
-RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float32)
-DEFAULT_LABEL_OUT_OF_RANGE = "clip"
-DEFAULT_DIFF_PENALTY_POWER = 2.0
-RUN_VALUE_TO_MET_SCALE = 0.1313
-CI_HALF_WIDTH_FACTOR = 0.5
+DEFAULT_CI_QUANTILE_LOWER = 0.4   # 80% 预测区间下界分位数
+DEFAULT_CI_QUANTILE_UPPER = 0.6   # 80% 预测区间上界分位数
+DEFAULT_CONF_WIDTH_THRESHOLDS = "0.5,1.0,1.5"  # CI 宽度阈值列表 (MET 原始单位)
 
 
 # ============================================================
@@ -202,187 +180,6 @@ def eval_metrics_prob(
     return base
 
 
-def met_to_run_value(y: np.ndarray) -> np.ndarray:
-    """Convert original met label to run_value by business formula."""
-    y = np.asarray(y, dtype=np.float32)
-    return (81.0 - y - 0.3127) / 0.1313 - 6.0
-
-
-def run_value_to_met(run_value: np.ndarray) -> np.ndarray:
-    """Convert run_value back to BW09-2 EH MET by business formula.
-
-    Inverse of ``met_to_run_value``:
-        run_value = (81.0 - met - 0.3127) / 0.1313 - 6.0
-    therefore:
-        met = 79.8995 - 0.1313 * run_value
-    """
-    run_value = np.asarray(run_value, dtype=np.float32)
-    return 79.8995 - RUN_VALUE_TO_MET_SCALE * run_value
-
-
-def run_value_to_final_y(run_value: np.ndarray, *, out_of_range: str = "clip") -> np.ndarray:
-    """Convert run_value to control coefficient final_y in {2, ..., 9}."""
-    rv = np.asarray(run_value, dtype=np.float32)
-    idx = np.searchsorted(RUN_VALUE_BOUNDS[1:-1], rv, side="right")
-    final_y = CLASS_LABELS[np.clip(idx, 0, len(CLASS_LABELS) - 1)].astype(np.float32)
-    in_range = (rv >= RUN_VALUE_BOUNDS[0]) & (rv < RUN_VALUE_BOUNDS[-1])
-
-    if out_of_range == "clip":
-        return final_y
-    if out_of_range == "nan":
-        final_y = final_y.astype(np.float32)
-        final_y[~in_range] = np.nan
-        return final_y
-    if out_of_range == "error":
-        if not np.all(in_range):
-            bad = int((~in_range).sum())
-            raise ValueError(f"Found {bad} run_value values outside [0, 100).")
-        return final_y
-    raise ValueError(f"Unsupported out_of_range policy: {out_of_range}")
-
-
-def met_to_final_y(y: np.ndarray, *, out_of_range: str = "clip") -> tuple[np.ndarray, np.ndarray, int]:
-    run_value = met_to_run_value(y)
-    final_y = run_value_to_final_y(run_value, out_of_range=out_of_range)
-    n_out = int(((run_value < RUN_VALUE_BOUNDS[0]) | (run_value >= RUN_VALUE_BOUNDS[-1])).sum())
-    return final_y, run_value, n_out
-
-
-def final_y_to_met(y_loop: np.ndarray) -> np.ndarray:
-    """Map loop_count/final_y class labels (2~9) to BW09-2 EH MET class centers."""
-    y_loop = np.asarray(y_loop, dtype=np.int64)
-    idx = np.searchsorted(CLASS_LABELS, y_loop, side="left")
-    idx = np.clip(idx, 0, len(CLASS_LABELS) - 1)
-    rv_lo = RUN_VALUE_BOUNDS[idx]
-    rv_hi = RUN_VALUE_BOUNDS[idx + 1]
-    rv_center = 0.5 * (rv_lo + rv_hi)
-    return run_value_to_met(rv_center)
-
-
-def round_clip_final_y(y_pred_cont: np.ndarray) -> np.ndarray:
-    """Convert continuous prediction into valid final_y class labels."""
-    y_pred_cont = np.asarray(y_pred_cont, dtype=np.float32)
-    return np.clip(np.rint(y_pred_cont), CLASS_LABELS[0], CLASS_LABELS[-1]).astype(int)
-
-
-def distance_to_run_boundary_met(y_pred_met: np.ndarray) -> np.ndarray:
-    """Distance (MET units) from prediction to nearest final_y run boundary."""
-    pred_run = met_to_run_value(np.asarray(y_pred_met, dtype=np.float32).reshape(-1))
-    internal_bounds = RUN_VALUE_BOUNDS[1:-1]
-    dist_run = np.min(
-        np.abs(pred_run.reshape(-1, 1) - internal_bounds.reshape(1, -1)),
-        axis=1,
-    )
-    return dist_run * RUN_VALUE_TO_MET_SCALE
-
-
-def final_y_confidence_score(
-    y_pred_met: np.ndarray,
-    ci_width_met: np.ndarray,
-    *,
-    eps: float = 1e-6,
-) -> np.ndarray:
-    """Higher score means more likely exact final_y hit (|diff| == 0)."""
-    y_pred_met = np.asarray(y_pred_met, dtype=np.float32).reshape(-1)
-    ci_width_met = np.asarray(ci_width_met, dtype=np.float32).reshape(-1)
-    boundary_margin_met = distance_to_run_boundary_met(y_pred_met)
-    half_width = np.maximum(ci_width_met * CI_HALF_WIDTH_FACTOR, eps)
-    score = boundary_margin_met / half_width
-    score = np.where(np.isfinite(score), score, -np.inf).astype(np.float32)
-    return score
-
-
-def eval_class_control_metrics(
-    y_true_cls: np.ndarray,
-    y_pred_cls: np.ndarray,
-    *,
-    penalty_power: float,
-) -> dict:
-    """Evaluate final_y ordinal classification metrics."""
-    y_true_cls = np.asarray(y_true_cls, dtype=int)
-    y_pred_cls = np.asarray(y_pred_cls, dtype=int)
-    diff = y_pred_cls - y_true_cls
-    abs_diff = np.abs(diff)
-    max_diff = int(CLASS_LABELS[-1] - CLASS_LABELS[0])
-
-    weighted_penalty = float(np.mean(abs_diff.astype(np.float32) ** penalty_power))
-    worst_penalty = float(max_diff ** penalty_power)
-    control_score = float(max(0.0, 100.0 * (1.0 - weighted_penalty / worst_penalty)))
-
-    return {
-        "accuracy": float(accuracy_score(y_true_cls, y_pred_cls) * 100.0),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true_cls, y_pred_cls) * 100.0),
-        "macro_f1": float(f1_score(y_true_cls, y_pred_cls, labels=CLASS_LABELS, average="macro", zero_division=0) * 100.0),
-        "within_1": float(np.mean(abs_diff <= 1) * 100.0),
-        "within_2": float(np.mean(abs_diff <= 2) * 100.0),
-        "mae_class": float(mean_absolute_error(y_true_cls, y_pred_cls)),
-        "rmse_class": float(np.sqrt(mean_squared_error(y_true_cls, y_pred_cls))),
-        "mean_signed_diff": float(np.mean(diff)),
-        "severe_diff_ge2": float(np.mean(abs_diff >= 2) * 100.0),
-        "extreme_diff_ge3": float(np.mean(abs_diff >= 3) * 100.0),
-        "weighted_penalty": weighted_penalty,
-        "control_score": control_score,
-    }
-
-
-def eval_final_y_subset_metrics(
-    y_true_cls_raw: np.ndarray,
-    y_pred_cls_raw: np.ndarray,
-    subset_mask: np.ndarray,
-    *,
-    penalty_power: float,
-) -> dict:
-    """Evaluate final_y metrics on an arbitrary boolean subset mask."""
-    subset_mask = np.asarray(subset_mask, dtype=bool)
-    n_samples = int(subset_mask.sum())
-    if n_samples == 0:
-        return {
-            "n_samples": 0,
-            "accuracy": float("nan"),
-            "balanced_accuracy": float("nan"),
-            "macro_f1": float("nan"),
-            "within_1": float("nan"),
-            "within_2": float("nan"),
-            "mae_class": float("nan"),
-            "rmse_class": float("nan"),
-            "mean_signed_diff": float("nan"),
-            "severe_diff_ge2": float("nan"),
-            "extreme_diff_ge3": float("nan"),
-            "weighted_penalty": float("nan"),
-            "control_score": float("nan"),
-        }
-    base = eval_class_control_metrics(
-        y_true_cls=y_true_cls_raw[subset_mask].astype(int),
-        y_pred_cls=y_pred_cls_raw[subset_mask].astype(int),
-        penalty_power=penalty_power,
-    )
-    base["n_samples"] = n_samples
-    return base
-
-
-def per_class_metrics(y_true_cls: np.ndarray, y_pred_cls: np.ndarray) -> pd.DataFrame:
-    rows = []
-    y_true_cls = np.asarray(y_true_cls, dtype=int)
-    y_pred_cls = np.asarray(y_pred_cls, dtype=int)
-    for cls in CLASS_LABELS:
-        mask = y_true_cls == cls
-        n = int(mask.sum())
-        if n == 0:
-            rows.append({"class": int(cls), "support": 0, "accuracy": np.nan, "within_1": np.nan, "mae_class": np.nan})
-            continue
-        abs_diff = np.abs(y_pred_cls[mask] - y_true_cls[mask])
-        rows.append(
-            {
-                "class": int(cls),
-                "support": n,
-                "accuracy": float(np.mean(abs_diff == 0) * 100.0),
-                "within_1": float(np.mean(abs_diff <= 1) * 100.0),
-                "mae_class": float(np.mean(abs_diff)),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def plot_pred_true_timeseries(
     y_test: np.ndarray,
     y_pred: np.ndarray,
@@ -436,108 +233,6 @@ def plot_pred_true_timeseries(
     plt.close()
 
 
-def plot_class_timeseries(
-    y_true_cls: np.ndarray,
-    y_pred_cls: np.ndarray,
-    test_is_ref: np.ndarray,
-    title: str,
-    out_path: str,
-) -> None:
-    x = np.arange(len(y_true_cls))
-    is_nonref = ~test_is_ref
-
-    plt.figure(figsize=(18, 6))
-    plt.plot(x, y_true_cls, color="black", alpha=0.45, linewidth=1.0, label="true final_y (all)")
-    plt.scatter(x[is_nonref], y_true_cls[is_nonref], s=10, color="black", alpha=0.65, label="true non-ref")
-    plt.scatter(x[test_is_ref], y_true_cls[test_is_ref], s=10, color="gray", alpha=0.35, label="true ref")
-
-    plt.plot(x, y_pred_cls, color="steelblue", alpha=0.65, linewidth=1.2, label="pred final_y (comp)")
-    plt.scatter(x[is_nonref], y_pred_cls[is_nonref], s=10, color="steelblue", alpha=0.7, label="pred non-ref")
-    plt.scatter(x[test_is_ref], y_pred_cls[test_is_ref], s=10, color="salmon", alpha=0.35, label="pred ref")
-
-    plt.fill_between(x, y_true_cls - 1, y_true_cls + 1, alpha=0.10, color="green", label="±1 acceptable band")
-
-    plt.yticks(CLASS_LABELS)
-    plt.ylim(CLASS_LABELS[0] - 0.7, CLASS_LABELS[-1] + 0.7)
-    plt.title(title)
-    plt.xlabel("test sample index (time order)")
-    plt.ylabel("final_y class / control coefficient")
-    plt.grid(alpha=0.25)
-    plt.legend(ncol=4, fontsize=9)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120)
-    plt.close()
-
-
-def plot_confusion_matrix(y_true_cls: np.ndarray, y_pred_cls: np.ndarray, title: str, out_path: str) -> None:
-    cm = confusion_matrix(y_true_cls, y_pred_cls, labels=CLASS_LABELS)
-    cm_norm = cm.astype(np.float32) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues", vmin=0.0, vmax=1.0)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="row-normalized ratio")
-
-    ax.set(
-        xticks=np.arange(len(CLASS_LABELS)),
-        yticks=np.arange(len(CLASS_LABELS)),
-        xticklabels=CLASS_LABELS,
-        yticklabels=CLASS_LABELS,
-        xlabel="predicted final_y",
-        ylabel="true final_y",
-        title=title,
-    )
-
-    thresh = cm_norm.max() / 2.0 if cm_norm.size else 0.5
-    for i in range(len(CLASS_LABELS)):
-        for j in range(len(CLASS_LABELS)):
-            text = f"{cm[i, j]}\n{cm_norm[i, j] * 100:.0f}%"
-            ax.text(j, i, text, ha="center", va="center", color="white" if cm_norm[i, j] > thresh else "black", fontsize=8)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=130)
-    plt.close()
-
-
-def plot_diff_penalty(y_true_cls: np.ndarray, y_pred_cls: np.ndarray, title: str, out_path: str, penalty_power: float) -> None:
-    diff = np.asarray(y_pred_cls, dtype=int) - np.asarray(y_true_cls, dtype=int)
-    abs_diff = np.abs(diff)
-    bins = np.arange(-7.5, 8.5, 1.0)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    axes[0].hist(diff, bins=bins, color="steelblue", alpha=0.75, edgecolor="black")
-    axes[0].axvline(0, color="black", linewidth=1.2)
-    axes[0].axvspan(-1, 1, color="green", alpha=0.10, label="|diff|<=1")
-    axes[0].set_xticks(np.arange(-7, 8, 1))
-    axes[0].set_title("Signed diff distribution (pred - true)")
-    axes[0].set_xlabel("diff")
-    axes[0].set_ylabel("count")
-    axes[0].grid(alpha=0.25)
-    axes[0].legend()
-
-    diff_levels = np.arange(0, 8, 1)
-    counts = np.array([(abs_diff == d).sum() for d in diff_levels], dtype=int)
-    penalties = diff_levels.astype(np.float32) ** penalty_power
-    axes[1].bar(diff_levels, counts, color="salmon", alpha=0.75, edgecolor="black", label="count")
-    ax2 = axes[1].twinx()
-    ax2.plot(diff_levels, penalties, color="darkred", marker="o", linewidth=2.0, label=f"penalty=|diff|^{penalty_power:g}")
-    axes[1].set_xticks(diff_levels)
-    axes[1].set_title("Absolute diff count and penalty curve")
-    axes[1].set_xlabel("|diff|")
-    axes[1].set_ylabel("count")
-    ax2.set_ylabel("single-sample penalty")
-    axes[1].grid(alpha=0.25)
-
-    lines1, labels1 = axes[1].get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    axes[1].legend(lines1 + lines2, labels1 + labels2, loc="upper right")
-
-    fig.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=130)
-    plt.close()
-
-
 def apply_residual_compensation(
     df_meta: pd.DataFrame,
     y_true: np.ndarray,
@@ -545,22 +240,11 @@ def apply_residual_compensation(
     lot_col: str,
     slot_col: str,
     reference_slot_ids: list[int],
-    *,
-    drop_limit_min: float | None = None,
-    drop_limit_max: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply residual compensation and identify lots to drop based on reference-wafer limits.
-    
-    Returns:
-        compensated: compensated predictions (same shape as y_pred)
-        lot_drop_mask: boolean mask indicating which samples belong to dropped lots
-    """
+) -> np.ndarray:
     compensated = y_pred.copy()
     lots = df_meta[lot_col].values
     slots = df_meta[slot_col].values
     is_ref = np.isin(slots, reference_slot_ids)
-    
-    lot_drop_mask = np.zeros(len(y_pred), dtype=bool)
 
     for lot in np.unique(lots):
         lot_mask = lots == lot
@@ -570,27 +254,13 @@ def apply_residual_compensation(
         if lot_ref_mask.sum() == 0:
             continue
 
-        # Check if this lot's reference wafers exceed limits
-        ref_mets = y_true[lot_ref_mask]
-        ref_mean = np.nanmean(ref_mets)
-        
-        should_drop = False
-        if drop_limit_min is not None and ref_mean < drop_limit_min:
-            should_drop = True
-        if drop_limit_max is not None and ref_mean > drop_limit_max:
-            should_drop = True
-        
-        if should_drop:
-            lot_drop_mask[lot_mask] = True
-            continue  # Skip compensation for dropped lot
-
         bias = np.nanmean(y_true[lot_ref_mask] - y_pred[lot_ref_mask])
         if np.isnan(bias):
             continue
 
         compensated[lot_nonref_mask] += bias
 
-    return compensated, lot_drop_mask
+    return compensated
 
 
 # ============================================================
@@ -938,138 +608,6 @@ def build_temporal_lot_features(
             result[col] = result[col].fillna(med)
 
     return result
-
-
-# ============================================================
-# R2R discharge-value (下货值 / *_REC*) feature engineering
-# ============================================================
-
-_REC_PATTERN = re.compile(r"_REC\d+$", re.IGNORECASE)
-
-
-def discover_rec_columns(df: pd.DataFrame, *, exclude_cols: set[str] | None = None) -> list[str]:
-    """Auto-detect R2R discharge-value columns, e.g. '0990.010201_REC4'."""
-    exclude_cols = exclude_cols or set()
-    return [c for c in df.columns if c not in exclude_cols and _REC_PATTERN.search(str(c))]
-
-
-def parse_rec_station(col: str) -> tuple[str, int]:
-    """Split 'oper_no_RECnum' -> (oper_no, num). e.g. '0990.010201_REC4' -> ('0990.010201', 4)."""
-    m = re.match(r"^(.*)_REC(\d+)$", str(col), re.IGNORECASE)
-    if m:
-        return m.group(1), int(m.group(2))
-    return str(col), 0
-
-
-def build_rec_features(
-    df: pd.DataFrame,
-    *,
-    rec_cols: list[str],
-    lot_col: str,
-    slot_col: str,
-    train_end: int,
-    pca_components: int = 4,
-    interaction_with_slot: bool = True,
-) -> pd.DataFrame:
-    """Build features from R2R discharge values (下货值).
-
-    Two complementary roles are captured:
-
-    1. **Direct effect** – raw per-station REC values (``rec_raw__*``) are passed
-       through, plus their cross-products with normalized slot position.
-    2. **Prior-state representation** – cross-station aggregates, per-oper_no
-       aggregates, deviation of the wafer's REC vector from its lot mean, and
-       cross-station PCA scores that compress the full discharge-value profile
-       into a few latent "incoming state" coordinates.
-
-    REC values are control inputs (known before measurement) so they are used for
-    every wafer with no leave-one-out needed.  Standardization and PCA bases are
-    fit on the training slice ``[:train_end]`` only, to remain leakage-clean.
-    """
-    if not rec_cols:
-        return pd.DataFrame(index=df.index)
-
-    rec_mat = df[rec_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
-    n_rows, n_cols = rec_mat.shape
-    feat: dict[str, np.ndarray] = {}
-
-    # ── 1. Raw pass-through (direct effect on current-station measurement) ────
-    for j, c in enumerate(rec_cols):
-        feat[f"rec_raw__{c}"] = rec_mat[:, j]
-
-    # ── 2. Cross-station row aggregates (combined-state magnitude) ────────────
-    feat["rec_row_mean"] = np.nanmean(rec_mat, axis=1)
-    feat["rec_row_std"] = np.nanstd(rec_mat, axis=1)
-    feat["rec_row_min"] = np.nanmin(rec_mat, axis=1)
-    feat["rec_row_max"] = np.nanmax(rec_mat, axis=1)
-    feat["rec_row_range"] = feat["rec_row_max"] - feat["rec_row_min"]
-    feat["rec_row_median"] = np.nanmedian(rec_mat, axis=1)
-    feat["rec_valid_count"] = np.sum(~np.isnan(rec_mat), axis=1).astype(np.float32)
-
-    # ── 3. Per-station (oper_no) aggregates ──────────────────────────────────
-    station_map: dict[str, list[int]] = {}
-    for j, c in enumerate(rec_cols):
-        st, _ = parse_rec_station(c)
-        station_map.setdefault(st, []).append(j)
-    for st, idxs in station_map.items():
-        sub = rec_mat[:, idxs]
-        safe_st = re.sub(r"[^0-9A-Za-z]+", "_", st).strip("_")
-        feat[f"rec_st_{safe_st}_mean"] = np.nanmean(sub, axis=1)
-        if sub.shape[1] > 1:
-            feat[f"rec_st_{safe_st}_std"] = np.nanstd(sub, axis=1)
-            feat[f"rec_st_{safe_st}_last"] = sub[:, -1]
-            feat[f"rec_st_{safe_st}_delta"] = sub[:, -1] - sub[:, 0]
-
-    # ── 4. Deviation of this wafer's REC vector from its lot mean ─────────────
-    lots = df[lot_col].to_numpy()
-    rec_dev = np.full_like(rec_mat, np.nan)
-    for lot in np.unique(lots):
-        m = lots == lot
-        lot_mean = np.nanmean(rec_mat[m], axis=0)
-        rec_dev[m] = rec_mat[m] - lot_mean[None, :]
-    feat["rec_lot_dev_absmean"] = np.nanmean(np.abs(rec_dev), axis=1)
-    feat["rec_lot_dev_l2"] = np.sqrt(np.nanmean(rec_dev ** 2, axis=1))
-
-    # ── 5. Cross-station PCA (latent incoming-state coordinates) ──────────────
-    if n_cols >= 1 and pca_components > 0:
-        train_mat = rec_mat[:max(train_end, 1)]
-        col_mean = np.nanmean(train_mat, axis=0)
-        col_std = np.nanstd(train_mat, axis=0)
-        col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0).astype(np.float32)
-        col_std = np.where((col_std > 1e-8) & np.isfinite(col_std), col_std, 1.0).astype(np.float32)
-
-        standardized = (np.where(np.isnan(rec_mat), col_mean[None, :], rec_mat) - col_mean[None, :]) / col_std[None, :]
-        n_comp = min(int(pca_components), n_cols, max(1, train_end))
-        try:
-            train_std = standardized[:max(train_end, 1)]
-            train_centered = train_std - np.nanmean(train_std, axis=0, keepdims=True)
-            _, _, vh = np.linalg.svd(np.nan_to_num(train_centered), full_matrices=False)
-            comps = vh[:n_comp]
-            scores = (np.nan_to_num(standardized) @ comps.T).astype(np.float32)
-            for k in range(scores.shape[1]):
-                feat[f"rec_pca{k + 1}"] = scores[:, k]
-        except np.linalg.LinAlgError:
-            pass
-
-    # ── 6. Interaction with slot position (position-dependent direct effect) ──
-    if interaction_with_slot:
-        slots = df[slot_col].to_numpy(dtype=np.float32)
-        slot_min = float(np.nanmin(slots))
-        slot_range = max(float(np.nanmax(slots)) - slot_min, 1.0)
-        slot_norm = ((slots - slot_min) / slot_range).astype(np.float32)
-        feat["rec_row_mean_x_slot"] = feat["rec_row_mean"] * slot_norm
-        if "rec_pca1" in feat:
-            feat["rec_pca1_x_slot"] = feat["rec_pca1"] * slot_norm
-
-    result = pd.DataFrame(feat, index=df.index)
-    result = result.replace([np.inf, -np.inf], np.nan)
-    for col in result.columns:
-        if result[col].isna().any():
-            med = result[col].median()
-            if not np.isfinite(med):
-                med = 0.0
-            result[col] = result[col].fillna(med)
-    return result.astype(np.float32)
 
 
 def _build_lot_reference_profiles(
@@ -1422,11 +960,11 @@ def create_model(
     average_before_softmax: bool,
     poly_features: int,
     subsample_samples: int,
-) -> TabPFNClassifier:
+) -> TabPFNRegressor:
     poly_features = max(1, int(poly_features))
     subsample_samples = max(256, int(subsample_samples))
 
-    return TabPFNClassifier(
+    return TabPFNRegressor(
         model_path=model_path,
         device="cuda",
         n_estimators=n_estimators,
@@ -1441,52 +979,26 @@ def create_model(
     )
 
 
-def predict_maybe_batched(model: TabPFNClassifier, X: pd.DataFrame, batch_size: int) -> np.ndarray:
-    classes = np.asarray(model.classes_)
-
-    def _proba_to_pred_met(proba: np.ndarray) -> np.ndarray:
-        pred_loop = classes[np.argmax(proba, axis=1)]
-        return final_y_to_met(pred_loop)
-
+def predict_maybe_batched(model: TabPFNRegressor, X: pd.DataFrame, batch_size: int) -> np.ndarray:
     if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
-        proba = model.predict_proba(X)
-        return _proba_to_pred_met(proba)
+        return model.predict(X)
 
     preds = []
     for i in range(0, len(X), batch_size):
-        proba = model.predict_proba(X.iloc[i:i + batch_size])
-        preds.append(_proba_to_pred_met(proba))
+        preds.append(model.predict(X.iloc[i:i + batch_size]))
     return np.concatenate(preds)
 
 
 def predict_maybe_batched_with_quantiles(
-    model: TabPFNClassifier,
+    model: TabPFNRegressor,
     X: pd.DataFrame,
     batch_size: int,
     ci_quantiles: list[float],
 ) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Return (mapped-MET predictions, [q_lower_array, q_upper_array, ...]) from class posteriors."""
-    classes = np.asarray(model.classes_)
-    class_mets = final_y_to_met(classes)
-    order = np.argsort(class_mets)
-    sorted_mets = class_mets[order]
-
+    """Return (mean_predictions, [q_lower_array, q_upper_array, ...]) using TabPFN quantile output."""
     def _predict_batch(batch: pd.DataFrame) -> tuple[np.ndarray, list[np.ndarray]]:
-        proba = model.predict_proba(batch)
-        pred_met = final_y_to_met(classes[np.argmax(proba, axis=1)])
-
-        sorted_proba = proba[:, order]
-        cdf = np.cumsum(sorted_proba, axis=1)
-        q_arrays: list[np.ndarray] = []
-        for q in ci_quantiles:
-            hit = cdf >= float(q)
-            q_idx = np.argmax(hit, axis=1)
-            no_hit = ~hit.any(axis=1)
-            # Numerical edge case: if row-wise CDF does not cross q due to
-            # floating-point accumulation, fall back to the nearest tail bin.
-            q_idx[no_hit] = 0 if q < 0.5 else (cdf.shape[1] - 1)
-            q_arrays.append(sorted_mets[q_idx])
-        return pred_met, q_arrays
+        result = model.predict(batch, output_type="main", quantiles=ci_quantiles)
+        return result["mean"], result["quantiles"]
 
     if batch_size is None or batch_size <= 0 or len(X) <= batch_size:
         return _predict_batch(X)
@@ -1503,7 +1015,7 @@ def predict_maybe_batched_with_quantiles(
 
 
 def fit_lot_latent_states(
-    model: TabPFNClassifier,
+    model: TabPFNRegressor,
     X_selected: pd.DataFrame,
     y: np.ndarray,
     df_meta: pd.DataFrame,
@@ -1539,7 +1051,7 @@ def fit_lot_latent_states(
     n_rows = len(df_meta)
 
     # Predict all rows with the initial model (one pass)
-    preds = predict_maybe_batched(model, X_selected, batch_size=None)
+    preds = model.predict(X_selected)
 
     # Normalise slot positions across the full dataset for consistent basis
     slot_min = float(slots.min())
@@ -1606,17 +1118,10 @@ def infer_one_dataset(
     ci_quantile_lower: float,
     ci_quantile_upper: float,
     conf_width_thresholds: list[float],
-    label_out_of_range: str = DEFAULT_LABEL_OUT_OF_RANGE,
-    diff_penalty_power: float = DEFAULT_DIFF_PENALTY_POWER,
     temporal_lot_window_k: int = DEFAULT_TEMPORAL_LOT_WINDOW_K,
     residual_pca_components: int = DEFAULT_RESIDUAL_PCA_COMPONENTS,
     learn_lot_state: bool = DEFAULT_LEARN_LOT_STATE,
     lot_state_dims: int = DEFAULT_LOT_STATE_DIMS,
-    use_rec_features: bool = DEFAULT_USE_REC_FEATURES,
-    rec_pca_components: int = DEFAULT_REC_PCA_COMPONENTS,
-    rec_interact_slot: bool = DEFAULT_REC_INTERACT_SLOT,
-    drop_limit_min: float | None = DEFAULT_DROP_LIMIT_MIN,
-    drop_limit_max: float | None = DEFAULT_DROP_LIMIT_MAX,
 ) -> dict | None:
     required = [target_col, slot_col, time_col]
     missing = [c for c in required if c not in df.columns]
@@ -1648,12 +1153,6 @@ def infer_one_dataset(
     # ── Build slot/reference-MET features (no FDC data used) ─────────────────
     t_prep0 = time.time()
     y = df[target_col].astype(float).to_numpy(dtype=np.float32)
-    y_final_all, _, n_out_range_all = met_to_final_y(y, out_of_range=label_out_of_range)
-    if n_out_range_all > 0:
-        print(
-            f"  final_y transform: out-of-range run_value={n_out_range_all}/{n_total} "
-            f"policy={label_out_of_range}"
-        )
     train_df = df.iloc[:val_end].copy()
     global_ref_model = fit_global_reference_model(
         train_df,
@@ -1694,27 +1193,6 @@ def infer_one_dataset(
         )
         X_raw = pd.concat([X_raw, X_temporal], axis=1)
 
-    # R2R discharge values (下货值): direct-effect + prior-state representation
-    if use_rec_features:
-        rec_cols = discover_rec_columns(
-            df,
-            exclude_cols={target_col, time_col, slot_col, lot_col, wafer_id_col},
-        )
-        if rec_cols:
-            X_rec = build_rec_features(
-                df,
-                rec_cols=rec_cols,
-                lot_col=lot_col,
-                slot_col=slot_col,
-                train_end=val_end,
-                pca_components=rec_pca_components,
-                interaction_with_slot=rec_interact_slot,
-            )
-            X_raw = pd.concat([X_raw, X_rec], axis=1)
-            print(f"  REC features: detected {len(rec_cols)} discharge cols -> +{X_rec.shape[1]} features")
-        else:
-            print("  REC features: none detected (no '*_REC*' columns)")
-
     X_raw = _coerce_mixed_columns_for_tabpfn(X_raw)
 
     X_train_for_select = X_raw.iloc[:val_end]
@@ -1751,20 +1229,7 @@ def infer_one_dataset(
         poly_features=poly_features,
         subsample_samples=subsample_samples,
     )
-    y_train_cls = y_final_all[:val_end]
-    train_valid_cls = np.isfinite(y_train_cls)
-    if train_valid_cls.sum() == 0:
-        print(f"  ⚠️ skip {dataset_name}: no valid class labels in train split")
-        return None
-    if train_valid_cls.sum() < len(y_train_cls):
-        print(
-            f"  final_y train labels: drop invalid {(~train_valid_cls).sum()}/"
-            f"{len(y_train_cls)} rows for classifier fit"
-        )
-    model.fit(
-        X_selected.iloc[:val_end][train_valid_cls],
-        y_train_cls[train_valid_cls].astype(int),
-    )
+    model.fit(X_selected.iloc[:val_end], y[:val_end])
     t_fit = time.time() - t_fit0
 
     # Approach 2 (learnable latent state): per-lot state vector, optional two-stage refinement ──
@@ -1800,10 +1265,7 @@ def infer_one_dataset(
             poly_features=poly_features,
             subsample_samples=subsample_samples,
         )
-        model.fit(
-            X_selected.iloc[:val_end][train_valid_cls],
-            y_train_cls[train_valid_cls].astype(int),
-        )
+        model.fit(X_selected.iloc[:val_end], y[:val_end])
         t_latent = time.time() - t_latent0
         print(f"  latent-state fit: dims={lot_state_dims} t={t_latent:.2f}s")
 
@@ -1830,28 +1292,14 @@ def infer_one_dataset(
         }
     )
     y_test = y[val_end:]
-    y_pred, lot_drop_mask = apply_residual_compensation(
+    y_pred = apply_residual_compensation(
         df_meta=meta_test,
         y_true=y_test,
         y_pred=y_pred_raw,
         lot_col=lot_col,
         slot_col=slot_col,
         reference_slot_ids=reference_slot_ids,
-        drop_limit_min=drop_limit_min,
-        drop_limit_max=drop_limit_max,
     )
-    
-    # Apply lot drop mask: exclude dropped lots from prediction
-    valid_lot_mask = ~lot_drop_mask
-    n_dropped_lots = int(np.unique(meta_test[lot_col].values[lot_drop_mask]).size) if lot_drop_mask.any() else 0
-    n_dropped_wafers = int(lot_drop_mask.sum())
-    
-    if drop_limit_min is not None or drop_limit_max is not None:
-        print(
-            f"  drop_limit: min={drop_limit_min} max={drop_limit_max} -> "
-            f"dropped {n_dropped_lots} lots ({n_dropped_wafers} wafers)"
-        )
-    
     # The per-sample bias shift from residual compensation must be applied
     # consistently to the CI bounds so that the interval remains centred on
     # the compensated mean prediction.
@@ -1860,11 +1308,8 @@ def infer_one_dataset(
     q_upper = q_upper_raw + bias_shift
     t_comp = time.time() - t_comp0
 
-    # ── Evaluate (non-ref only, excluding dropped lots) with probability interval metrics ─────────────
-    # Modified coverage: predicted wafers / all test wafers (including reference)
-    n_test_all = len(y_test)  # Total test wafers (ref + non-ref)
-    test_is_nonref_mask = ~test_is_ref & valid_lot_mask  # Non-ref and not dropped
-    
+    # ── Evaluate (non-ref only) with probability interval metrics ─────────────
+    test_is_nonref_mask = ~test_is_ref
     metrics = eval_metrics_prob(
         y_true=y_test[test_is_nonref_mask],
         y_pred=y_pred[test_is_nonref_mask],
@@ -1873,99 +1318,9 @@ def infer_one_dataset(
         conf_width_thresholds=conf_width_thresholds,
     )
 
-    y_test_cls_raw = y_final_all[val_end:]
-    y_pred_cls_raw = run_value_to_final_y(
-        met_to_run_value(y_pred),
-        out_of_range=label_out_of_range,
-    )
-    ci_width_all = q_upper - q_lower
-    valid_final_mask = np.isfinite(y_test_cls_raw) & np.isfinite(y_pred_cls_raw)
-    final_eval_mask = test_is_nonref_mask & valid_final_mask
-    if final_eval_mask.sum() == 0:
-        print(f"  ⚠️ skip {dataset_name}: no valid non-ref rows for final_y evaluation")
-        return None
-
-    final_metrics = eval_final_y_subset_metrics(
-        y_true_cls_raw=y_test_cls_raw,
-        y_pred_cls_raw=y_pred_cls_raw,
-        subset_mask=final_eval_mask,
-        penalty_power=diff_penalty_power,
-    )
-    per_cls = per_class_metrics(
-        y_true_cls=y_test_cls_raw[final_eval_mask].astype(int),
-        y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
-    )
-
-    n_test_nonref_predicted = int(test_is_nonref_mask.sum())  # Actually predicted non-ref wafers
-    metrics_final_y_ci_thresholds: dict[str, dict] = {}
-    for thr in conf_width_thresholds:
-        key = f"ci_thr{thr:.1f}"
-        subset_mask = test_is_nonref_mask & (ci_width_all <= thr)
-        subset_eval_mask = subset_mask & valid_final_mask
-        subset_size = int(subset_mask.sum())
-        # Modified coverage: predicted wafers / all test wafers
-        coverage_pct = float((subset_size / n_test_all) * 100.0) if n_test_all > 0 else float("nan")
-        subset_metrics = eval_final_y_subset_metrics(
-            y_true_cls_raw=y_test_cls_raw,
-            y_pred_cls_raw=y_pred_cls_raw,
-            subset_mask=subset_eval_mask,
-            penalty_power=diff_penalty_power,
-        )
-        metrics_final_y_ci_thresholds[key] = {
-            "threshold": float(thr),
-            "coverage_pct": coverage_pct,
-            "subset_size": subset_size,
-            "final_eval_size": int(subset_eval_mask.sum()),
-            **subset_metrics,
-        }
-
-    boundary_margin_all = distance_to_run_boundary_met(y_pred)
-    confidence_score_all = final_y_confidence_score(y_pred, ci_width_all)
-    nonref_indices = np.flatnonzero(test_is_nonref_mask)
-    sorted_nonref_indices = nonref_indices[
-        np.argsort(-confidence_score_all[nonref_indices], kind="stable")
-    ]
-    metrics_final_y_coverage: dict[str, dict] = {}
-    for cov in DEFAULT_CONF_COVERAGE_LEVELS:
-        cov_pct = int(round(cov * 100))
-        key = f"cov{cov_pct}"
-        if n_test_nonref_predicted > 0:
-            subset_size = int(np.ceil(cov * n_test_nonref_predicted))
-            subset_idx = sorted_nonref_indices[:subset_size]
-            subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
-            subset_mask[subset_idx] = True
-            # Modified coverage: predicted wafers / all test wafers
-            achieved_coverage_pct = float((subset_size / n_test_all) * 100.0)
-        else:
-            subset_size = 0
-            subset_mask = np.zeros_like(test_is_nonref_mask, dtype=bool)
-            achieved_coverage_pct = float("nan")
-        subset_eval_mask = subset_mask & valid_final_mask
-        subset_metrics = eval_final_y_subset_metrics(
-            y_true_cls_raw=y_test_cls_raw,
-            y_pred_cls_raw=y_pred_cls_raw,
-            subset_mask=subset_eval_mask,
-            penalty_power=diff_penalty_power,
-        )
-        metrics_final_y_coverage[key] = {
-            "target_coverage_pct": float(cov * 100.0),
-            "achieved_coverage_pct": achieved_coverage_pct,
-            "subset_size": subset_size,
-            "final_eval_size": int(subset_eval_mask.sum()),
-            "ranking_strategy": "margin_over_ci_half_width",
-            "confidence_score_mean": float(np.mean(confidence_score_all[subset_mask])) if subset_size > 0 else float("nan"),
-            "ci_width_mean": float(np.mean(ci_width_all[subset_mask])) if subset_size > 0 else float("nan"),
-            "boundary_margin_met_mean": float(np.mean(boundary_margin_all[subset_mask])) if subset_size > 0 else float("nan"),
-            **subset_metrics,
-        }
-
     t_plot0 = time.time()
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_path = os.path.join(output_dir, f"{safe}_infer_timeseries.png")
-    class_timeseries_path = os.path.join(output_dir, f"{safe}_plus_class_timeseries.png")
-    cm_path = os.path.join(output_dir, f"{safe}_plus_confusion_matrix.png")
-    diff_path = os.path.join(output_dir, f"{safe}_plus_diff_penalty.png")
-    per_class_path = os.path.join(output_dir, f"{safe}_plus_per_class_metrics.csv")
     ci_quantile_label = f"CI[{ci_quantile_lower:.0%},{ci_quantile_upper:.0%}]"
     plot_pred_true_timeseries(
         y_test=y_test,
@@ -1981,34 +1336,6 @@ def infer_one_dataset(
         q_lower=q_lower,
         q_upper=q_upper,
     )
-    y_test_cls_plot = run_value_to_final_y(met_to_run_value(y_test), out_of_range="clip").astype(int)
-    y_pred_cls_plot = run_value_to_final_y(met_to_run_value(y_pred), out_of_range="clip").astype(int)
-    plot_class_timeseries(
-        y_true_cls=y_test_cls_plot,
-        y_pred_cls=y_pred_cls_plot,
-        test_is_ref=test_is_ref,
-        title=(
-            f"{dataset_name} | COMP Non-ref Acc={final_metrics['accuracy']:.1f}% "
-            f"Within1={final_metrics['within_1']:.1f}% "
-            f"Severe(|d|>=2)={final_metrics['severe_diff_ge2']:.1f}% "
-            f"Score={final_metrics['control_score']:.1f}"
-        ),
-        out_path=class_timeseries_path,
-    )
-    plot_confusion_matrix(
-        y_true_cls=y_test_cls_raw[final_eval_mask].astype(int),
-        y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
-        title=f"{dataset_name} | Non-ref confusion matrix",
-        out_path=cm_path,
-    )
-    plot_diff_penalty(
-        y_true_cls=y_test_cls_raw[final_eval_mask].astype(int),
-        y_pred_cls=y_pred_cls_raw[final_eval_mask].astype(int),
-        title=f"{dataset_name} | Non-ref diff penalty evaluation",
-        out_path=diff_path,
-        penalty_power=diff_penalty_power,
-    )
-    per_cls.to_csv(per_class_path, index=False)
     t_plot = time.time() - t_plot0
 
     print(
@@ -2019,28 +1346,13 @@ def infer_one_dataset(
     return {
         "dataset": dataset_name,
         "n_rows": int(n_total),
-        "n_out_range_final_y": int(n_out_range_all),
         "n_features_raw": int(fs_info["raw_features"]),
         "n_features_used": int(len(selected_cols)),
         "n_test": int(n_total - val_end),
-        "n_test_all": int(n_test_all),  # New: total test wafers
-        "n_test_nonref": int(test_is_nonref.sum()),  # Original non-ref count
-        "n_test_nonref_predicted": int(n_test_nonref_predicted),  # After dropping
-        "n_dropped_lots": int(n_dropped_lots),
-        "n_dropped_wafers": int(n_dropped_wafers),
-        "n_test_nonref_final_eval": int(final_eval_mask.sum()),
+        "n_test_nonref": int(test_is_nonref.sum()),
         "time_sec": float(infer_time),
-        "metrics_met": metrics,
-        "metrics_final_y": final_metrics,
-        "metrics_final_y_ci_thresholds": metrics_final_y_ci_thresholds,
-        "metrics_final_y_coverage": metrics_final_y_coverage,
-        "plots": {
-            "met_timeseries": plot_path,
-            "final_y_timeseries": class_timeseries_path,
-            "confusion_matrix": cm_path,
-            "diff_penalty": diff_path,
-            "per_class_csv": per_class_path,
-        },
+        "metrics": metrics,
+        "plot": plot_path,
     }
 
 
@@ -2057,10 +1369,7 @@ def _parse_reference_slot_ids(s: str) -> list[int]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=(
-            "TabPFN probabilistic MET inference + final_y control evaluation. "
-            "Outputs both interval-based MET metrics and plus-style final_y metrics."
-        )
+        description="Fast TabPFN baseline inference with aggressive feature pruning and per-lot residual compensation."
     )
 
     p.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH, help="Input file or folder (csv/parquet).")
@@ -2080,18 +1389,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=DEFAULT_REFERENCE_SLOT_IDS,
         help='Comma-separated slot ids, e.g. "2,3,4,5,12,13,20,21,22,23".',
-    )
-    p.add_argument(
-        "--drop-limit-min",
-        type=float,
-        default=DEFAULT_DROP_LIMIT_MIN,
-        help="Drop lots when reference-wafer mean MET is below this threshold (None = disabled).",
-    )
-    p.add_argument(
-        "--drop-limit-max",
-        type=float,
-        default=DEFAULT_DROP_LIMIT_MAX,
-        help="Drop lots when reference-wafer mean MET is above this threshold (None = disabled).",
     )
 
     p.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
@@ -2154,28 +1451,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Approach 2 (learnable latent state): dimensionality K of the per-lot state vector (requires --learn-lot-state).",
     )
 
-    # ── R2R discharge-value (下货值 / *_REC*) features ─────────────────────────
-    p.add_argument(
-        "--no-rec-features",
-        dest="use_rec_features",
-        action="store_false",
-        default=DEFAULT_USE_REC_FEATURES,
-        help="Disable R2R discharge-value (*_REC*) feature engineering.",
-    )
-    p.add_argument(
-        "--rec-pca-components",
-        type=int,
-        default=DEFAULT_REC_PCA_COMPONENTS,
-        help="Number of cross-station PCA components built from discharge values (prior-state representation).",
-    )
-    p.add_argument(
-        "--no-rec-interact-slot",
-        dest="rec_interact_slot",
-        action="store_false",
-        default=DEFAULT_REC_INTERACT_SLOT,
-        help="Disable discharge-value × slot-position cross terms.",
-    )
-
     p.add_argument(
         "--ci-quantile-lower",
         type=float,
@@ -2199,19 +1474,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=DEFAULT_CONF_WIDTH_THRESHOLDS,
         help='Comma-separated CI-width thresholds for high-confidence evaluation, e.g. "1.0,2.0,3.0".',
-    )
-    p.add_argument(
-        "--label-out-of-range",
-        type=str,
-        choices=["clip", "nan", "error"],
-        default=DEFAULT_LABEL_OUT_OF_RANGE,
-        help="How to handle run_value outside [0,100): clip to edge class, drop as nan, or raise error.",
-    )
-    p.add_argument(
-        "--diff-penalty-power",
-        type=float,
-        default=DEFAULT_DIFF_PENALTY_POWER,
-        help="Penalty exponent for ordered class diff. 2 means quadratic penalty: diff=2 costs 4x diff=1.",
     )
 
     return p
@@ -2244,14 +1506,6 @@ def main() -> None:
     print(
         f"CI interval: [{args.ci_quantile_lower:.0%}, {args.ci_quantile_upper:.0%}] | "
         f"conf-width thresholds: {conf_width_thresholds}"
-    )
-    print(
-        "Plus eval enabled: met -> run_value -> final_y classes; report within_1, severe_diff_ge2, "
-        "weighted_penalty, control_score."
-    )
-    print(
-        f"REC (下货值) features: {'ON' if args.use_rec_features else 'OFF'} | "
-        f"pca_components={args.rec_pca_components} | interact_slot={args.rec_interact_slot}"
     )
 
     all_results = []
@@ -2289,80 +1543,35 @@ def main() -> None:
                 ci_quantile_lower=args.ci_quantile_lower,
                 ci_quantile_upper=args.ci_quantile_upper,
                 conf_width_thresholds=conf_width_thresholds,
-                label_out_of_range=args.label_out_of_range,
-                diff_penalty_power=args.diff_penalty_power,
                 temporal_lot_window_k=args.temporal_lot_window_k,
                 residual_pca_components=args.residual_pca_components,
                 learn_lot_state=args.learn_lot_state,
                 lot_state_dims=args.lot_state_dims,
-                use_rec_features=args.use_rec_features,
-                rec_pca_components=args.rec_pca_components,
-                rec_interact_slot=args.rec_interact_slot,
-                drop_limit_min=args.drop_limit_min,
-                drop_limit_max=args.drop_limit_max,
             )
             if res is not None:
                 all_results.append(res)
-                m_met = res["metrics_met"]
-                m_final = res["metrics_final_y"]
-                m_final_ci = res.get("metrics_final_y_ci_thresholds", {})
-                m_final_cov = res.get("metrics_final_y_coverage", {})
+                m = res["metrics"]
                 print(
-                    f"  MET COMP Non-ref: MAE={m_met['mae']:.4f} R²={m_met['r2']:.4f} "
-                    f"Acc@0.5={m_met['acc05']:.1f}% Acc@1.0={m_met['acc10']:.1f}% "
-                    f"| CI-width mean={m_met['ci_width_mean']:.3f} median={m_met['ci_width_median']:.3f} "
-                    f"| empirical-coverage={m_met['ci_empirical_coverage_pct']:.1f}%"
+                    f"  COMP Non-ref: MAE={m['mae']:.4f} R²={m['r2']:.4f} "
+                    f"Acc@0.5={m['acc05']:.1f}% Acc@1.0={m['acc10']:.1f}% "
+                    f"| CI-width mean={m['ci_width_mean']:.3f} median={m['ci_width_median']:.3f} "
+                    f"| empirical-coverage={m['ci_empirical_coverage_pct']:.1f}%"
                 )
                 for thr in conf_width_thresholds:
                     key = f"ci_thr{thr:.1f}"
-                    cov = m_met.get(f"{key}_coverage_pct", float("nan"))
-                    thr_mae = m_met.get(f"{key}_mae", float("nan"))
-                    thr_acc05 = m_met.get(f"{key}_acc05", float("nan"))
-                    thr_acc10 = m_met.get(f"{key}_acc10", float("nan"))
+                    cov = m.get(f"{key}_coverage_pct", float("nan"))
+                    thr_mae = m.get(f"{key}_mae", float("nan"))
+                    thr_acc05 = m.get(f"{key}_acc05", float("nan"))
+                    thr_acc10 = m.get(f"{key}_acc10", float("nan"))
                     print(
                         f"    CI-width≤{thr:.1f}: coverage={cov:.1f}% "
                         f"MAE={thr_mae:.4f} Acc@0.5={thr_acc05:.1f}% Acc@1.0={thr_acc10:.1f}%"
                     )
                 print(
-                    f"  final_y COMP Non-ref: Acc={m_final['accuracy']:.1f}% "
-                    f"BalancedAcc={m_final['balanced_accuracy']:.1f}% "
-                    f"MacroF1={m_final['macro_f1']:.1f}% Within1={m_final['within_1']:.1f}% "
-                    f"Severe(|d|>=2)={m_final['severe_diff_ge2']:.1f}% "
-                    f"Penalty={m_final['weighted_penalty']:.3f} Score={m_final['control_score']:.1f}"
-                )
-                for thr in conf_width_thresholds:
-                    key = f"ci_thr{thr:.1f}"
-                    m_ci = m_final_ci.get(key, {})
-                    print(
-                        f"    final_y CI-width≤{thr:.1f}: coverage={m_ci.get('coverage_pct', float('nan')):.1f}% "
-                        f"n={int(m_ci.get('subset_size', 0))} eval_n={int(m_ci.get('final_eval_size', 0))} "
-                        f"Acc={m_ci.get('accuracy', float('nan')):.1f}% "
-                        f"Within1={m_ci.get('within_1', float('nan')):.1f}% "
-                        f"Severe(|d|>=2)={m_ci.get('severe_diff_ge2', float('nan')):.1f}% "
-                        f"Score={m_ci.get('control_score', float('nan')):.1f}"
-                    )
-                for cov in DEFAULT_CONF_COVERAGE_LEVELS:
-                    cov_pct = int(round(cov * 100))
-                    key = f"cov{cov_pct}"
-                    m_cov = m_final_cov.get(key, {})
-                    strategy = m_cov.get("ranking_strategy", "margin_over_ci_half_width")
-                    print(
-                        f"    final_y top-confidence coverage≈{cov_pct}% ({strategy}): achieved={m_cov.get('achieved_coverage_pct', float('nan')):.1f}% "
-                        f"n={int(m_cov.get('subset_size', 0))} eval_n={int(m_cov.get('final_eval_size', 0))} "
-                        f"Acc={m_cov.get('accuracy', float('nan')):.1f}% "
-                        f"Within1={m_cov.get('within_1', float('nan')):.1f}% "
-                        f"Severe(|d|>=2)={m_cov.get('severe_diff_ge2', float('nan')):.1f}% "
-                        f"Score={m_cov.get('control_score', float('nan')):.1f}"
-                    )
-                print(
                     f"  | time={res['time_sec']:.1f}s "
                     f"| features={res['n_features_raw']}->{res['n_features_used']}"
                 )
-                print(f"  plot.met_timeseries={res['plots']['met_timeseries']}")
-                print(f"  plot.final_y_timeseries={res['plots']['final_y_timeseries']}")
-                print(f"  plot.confusion={res['plots']['confusion_matrix']}")
-                print(f"  plot.diff_penalty={res['plots']['diff_penalty']}")
-                print(f"  csv.per_class={res['plots']['per_class_csv']}")
+                print(f"  plot={res['plot']}")
         except Exception as e:
             print(f"  ❌ failed: {type(e).__name__}: {e}")
         finally:
@@ -2372,34 +1581,19 @@ def main() -> None:
     print(f"\nDone. success={len(all_results)}/{len(files)} total_time={time.time()-t_all:.1f}s")
 
     if all_results:
-        avg_mae = float(np.mean([r["metrics_met"]["mae"] for r in all_results]))
-        avg_acc05 = float(np.mean([r["metrics_met"]["acc05"] for r in all_results]))
-        avg_acc10 = float(np.mean([r["metrics_met"]["acc10"] for r in all_results]))
-        avg_ci_width = float(np.mean([r["metrics_met"]["ci_width_mean"] for r in all_results]))
-        avg_ci_cov = float(np.mean([r["metrics_met"]["ci_empirical_coverage_pct"] for r in all_results]))
+        avg_mae = float(np.mean([r["metrics"]["mae"] for r in all_results]))
+        avg_acc05 = float(np.mean([r["metrics"]["acc05"] for r in all_results]))
+        avg_acc10 = float(np.mean([r["metrics"]["acc10"] for r in all_results]))
+        avg_ci_width = float(np.mean([r["metrics"]["ci_width_mean"] for r in all_results]))
+        avg_ci_cov = float(np.mean([r["metrics"]["ci_empirical_coverage_pct"] for r in all_results]))
         print(
-            f"AVG MET COMP Non-ref MAE={avg_mae:.4f} | "
+            f"AVG COMP Non-ref MAE={avg_mae:.4f} | "
             f"AVG Acc@0.5={avg_acc05:.1f}% | AVG Acc@1.0={avg_acc10:.1f}% | "
             f"AVG CI-width={avg_ci_width:.3f} | AVG empirical-coverage={avg_ci_cov:.1f}%"
         )
-        avg_final_acc = float(np.mean([r["metrics_final_y"]["accuracy"] for r in all_results]))
-        avg_final_within1 = float(np.mean([r["metrics_final_y"]["within_1"] for r in all_results]))
-        avg_final_severe = float(np.mean([r["metrics_final_y"]["severe_diff_ge2"] for r in all_results]))
-        avg_final_penalty = float(np.mean([r["metrics_final_y"]["weighted_penalty"] for r in all_results]))
-        avg_final_score = float(np.mean([r["metrics_final_y"]["control_score"] for r in all_results]))
-        print(
-            f"AVG final_y COMP Non-ref Acc={avg_final_acc:.1f}% | "
-            f"AVG Within1={avg_final_within1:.1f}% | "
-            f"AVG Severe(|d|>=2)={avg_final_severe:.1f}% | "
-            f"AVG Penalty={avg_final_penalty:.3f} | AVG ControlScore={avg_final_score:.1f}"
-        )
         for thr in conf_width_thresholds:
             key = f"ci_thr{thr:.1f}"
-            valid = [
-                r["metrics_met"]
-                for r in all_results
-                if not np.isnan(r["metrics_met"].get(f"{key}_mae", float("nan")))
-            ]
+            valid = [r["metrics"] for r in all_results if not np.isnan(r["metrics"].get(f"{key}_mae", float("nan")))]
             if valid:
                 avg_thr_cov = float(np.mean([m[f"{key}_coverage_pct"] for m in valid]))
                 avg_thr_mae = float(np.mean([m[f"{key}_mae"] for m in valid]))
@@ -2407,35 +1601,6 @@ def main() -> None:
                 print(
                     f"  AVG CI-width≤{thr:.1f}: coverage={avg_thr_cov:.1f}% "
                     f"MAE={avg_thr_mae:.4f} Acc@0.5={avg_thr_acc05:.1f}%"
-                )
-            final_valid = [
-                r["metrics_final_y_ci_thresholds"].get(key, {})
-                for r in all_results
-                if not np.isnan(r["metrics_final_y_ci_thresholds"].get(key, {}).get("accuracy", float("nan")))
-            ]
-            if final_valid:
-                avg_final_cov = float(np.mean([m["coverage_pct"] for m in final_valid]))
-                avg_final_acc = float(np.mean([m["accuracy"] for m in final_valid]))
-                avg_final_within1 = float(np.mean([m["within_1"] for m in final_valid]))
-                print(
-                    f"  AVG final_y CI-width≤{thr:.1f}: coverage={avg_final_cov:.1f}% "
-                    f"Acc={avg_final_acc:.1f}% Within1={avg_final_within1:.1f}%"
-                )
-        for cov in DEFAULT_CONF_COVERAGE_LEVELS:
-            cov_pct = int(round(cov * 100))
-            key = f"cov{cov_pct}"
-            valid_cov = [
-                r["metrics_final_y_coverage"].get(key, {})
-                for r in all_results
-                if not np.isnan(r["metrics_final_y_coverage"].get(key, {}).get("accuracy", float("nan")))
-            ]
-            if valid_cov:
-                avg_achieved = float(np.mean([m["achieved_coverage_pct"] for m in valid_cov]))
-                avg_cov_acc = float(np.mean([m["accuracy"] for m in valid_cov]))
-                avg_cov_within1 = float(np.mean([m["within_1"] for m in valid_cov]))
-                print(
-                    f"  AVG final_y top-confidence coverage≈{cov_pct}%: achieved={avg_achieved:.1f}% "
-                    f"Acc={avg_cov_acc:.1f}% Within1={avg_cov_within1:.1f}%"
                 )
 
 
