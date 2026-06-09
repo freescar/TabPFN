@@ -78,8 +78,8 @@ warnings.filterwarnings("ignore")
 # Defaults
 # ============================================================
 
-DEFAULT_PREMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/"
-DEFAULT_POSTMET_DATA_PATH = ""          # required – path to a single postmet csv/parquet file
+DEFAULT_PREMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/A2_DBJOA_BW09_Simple_Tabpfn_Tool01_CHA1.csv"
+DEFAULT_POSTMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_PLUS_20260101_20260601_merge_curr_pre_r2r_post_36tool.csv"          # required – path to a single postmet csv/parquet file
 
 DEFAULT_OUTPUT_DIR = "./results/twostage"
 
