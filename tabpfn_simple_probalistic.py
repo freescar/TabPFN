@@ -169,7 +169,7 @@ def eval_metrics_prob(
         coverage_pct = float(np.mean(high_conf) * 100.0)
         coverage_pct_of_total = float(high_conf.sum() / denominator * 100.0)
         key_prefix = f"ci_thr{thr:.1f}"
-        base[f"{key_prefix}_coverage_pct"] = coverage_pct_of_total  # Coverage as % of total test samples
+        base[f"{key_prefix}_coverage_pct_of_total"] = coverage_pct_of_total  # Coverage as % of total test samples
         base[f"{key_prefix}_coverage_pct_of_subset"] = coverage_pct  # Coverage as % of non-ref samples
         if high_conf.sum() > 0:
             base[f"{key_prefix}_mae"] = float(mean_absolute_error(y_true[high_conf], y_pred[high_conf]))
