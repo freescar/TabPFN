@@ -23,6 +23,17 @@ Outputs
   <output_dir>/<dataset>_postmet_timeseries.png  – PostMET time-series (both scenarios)
   <output_dir>/<dataset>_postmet_scatter.png     – PostMET scatter (both scenarios)
   <output_dir>/<dataset>_results.json            – All metrics (premet + loop-count + postmet)
+
+
+  python premet_postmet_twostage_tabpfn.py \
+  --premet-data-path /data/premet/ \
+  --postmet-data-path /data/postmet_train.parquet \
+  --output-dir ./results/twostage \
+  --target-col GroundTruth \
+  --postmet-pre-met-col BW092EH_MET \
+  --postmet-post-met-col BW092WETEH_MET \
+  --postmet-loop-count-col loop_count \
+  --model-path /models/tabpfn-v3.ckpt
 """
 
 import os
