@@ -2067,4 +2067,6 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     print("Process finished, exiting now...", flush=True)
+    # Use os._exit to bypass Python atexit handlers, which prevents occasional
+    # CUDA / torch teardown hangs when running on GPU (matches source scripts).
     os._exit(0)
