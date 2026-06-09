@@ -138,12 +138,17 @@ def eval_metrics_prob(
     q_lower: np.ndarray,
     q_upper: np.ndarray,
     conf_width_thresholds: list[float],
+    n_total_test: int | None = None,
 ) -> dict:
     """Extended metrics including prediction-interval statistics and threshold-based accuracy.
 
     For each threshold in *conf_width_thresholds*, a "high-confidence" subset is defined as
     samples whose CI width (q_upper - q_lower) is at most the threshold.  Standard regression
     metrics are then computed on that subset, together with the coverage fraction.
+    
+    Args:
+        n_total_test: If provided, coverage is reported as % of ALL test samples.
+                      If None (default), coverage is % of y_true length (backward compatible).
     """
     base = eval_metrics(y_true, y_pred)
 
@@ -156,11 +161,16 @@ def eval_metrics_prob(
         "ci_empirical_coverage_pct": empirical_coverage,
     })
 
+    # Use n_total_test as base denominator if provided, otherwise use len(y_true)
+    denominator = n_total_test if n_total_test is not None else len(y_true)
+
     for thr in conf_width_thresholds:
         high_conf = ci_width <= thr
         coverage_pct = float(np.mean(high_conf) * 100.0)
+        coverage_pct_of_total = float(high_conf.sum() / denominator * 100.0)
         key_prefix = f"ci_thr{thr:.1f}"
-        base[f"{key_prefix}_coverage_pct"] = coverage_pct
+        base[f"{key_prefix}_coverage_pct"] = coverage_pct_of_total  # Coverage as % of total test samples
+        base[f"{key_prefix}_coverage_pct_of_subset"] = coverage_pct  # Coverage as % of non-ref samples
         if high_conf.sum() > 0:
             base[f"{key_prefix}_mae"] = float(mean_absolute_error(y_true[high_conf], y_pred[high_conf]))
             base[f"{key_prefix}_r2"] = float(r2_score(y_true[high_conf], y_pred[high_conf]))
@@ -181,23 +191,26 @@ def eval_metrics_by_coverage(
     q_lower: np.ndarray,
     q_upper: np.ndarray,
     coverage_thresholds: list[float],
+    n_total_test: int | None = None,
 ) -> dict:
     """
     评估：按照 coverage 百分比划分样本，计算对应指标。
     
     coverage_thresholds: 列表，每个元素是 [0,1] 之间的浮点数，表示占总样本的百分比。
+    n_total_test: 用于计算覆盖百分比的总样本数。如果为None，则使用len(y_true)。
     
     返回字典，键为 "cov_N%" 的形式，值为该阈值下的指标。
     """
     result = {}
-    n_total = len(y_true)
+    n_subset = len(y_true)  # Number of non-ref samples
+    n_total = n_total_test if n_total_test is not None else n_subset
     
     # 按照 CI 宽度排序，选择最窄的样本
     ci_width = q_upper - q_lower
     sorted_idx = np.argsort(ci_width)
     
     for cov_pct in coverage_thresholds:
-        n_select = max(1, int(n_total * cov_pct))
+        n_select = max(1, int(n_subset * cov_pct))
         selected_idx = sorted_idx[:n_select]
         
         y_true_sel = y_true[selected_idx]
@@ -214,7 +227,8 @@ def eval_metrics_by_coverage(
         key = f"cov_{cov_pct*100:.0f}pct"
         result[key] = {
             "n_samples": int(n_select),
-            "coverage_pct": float(n_select / n_total * 100.0),
+            "coverage_pct_of_subset": float(n_select / n_subset * 100.0),  # % of non-ref samples
+            "coverage_pct_of_total": float(n_select / n_total * 100.0),    # % of all test samples
             "mae": metrics_sel["mae"],
             "r2": metrics_sel["r2"],
             "acc05": metrics_sel["acc05"],
@@ -1251,14 +1265,17 @@ def infer_one_dataset(
     t_comp = time.time() - t_comp0
 
     test_is_nonref_mask = ~test_is_ref
+    n_test_total = len(y_test)  # Total test samples
+    n_test_nonref = test_is_nonref.sum()  # Non-ref test samples
     
-    # 原始覆盖 + 基础指标
+    # 原始覆盖 + 基础指标（计算时传入总测试样本数）
     metrics = eval_metrics_prob(
         y_true=y_test[test_is_nonref_mask],
         y_pred=y_pred[test_is_nonref_mask],
         q_lower=q_lower[test_is_nonref_mask],
         q_upper=q_upper[test_is_nonref_mask],
         conf_width_thresholds=conf_width_thresholds,
+        n_total_test=n_test_total,
     )
     
     # 按 coverage 百分比的精细化评估
@@ -1268,6 +1285,7 @@ def infer_one_dataset(
         q_lower=q_lower[test_is_nonref_mask],
         q_upper=q_upper[test_is_nonref_mask],
         coverage_thresholds=coverage_thresholds,
+        n_total_test=n_test_total,
     )
     
     # 合并所有指标
@@ -1304,7 +1322,7 @@ def infer_one_dataset(
         "n_features_raw": int(fs_info["raw_features"]),
         "n_features_used": int(len(selected_cols)),
         "n_test": int(n_total - val_end),
-        "n_test_nonref": int(test_is_nonref.sum()),
+        "n_test_nonref": int(n_test_nonref),
         "time_sec": float(infer_time),
         "metrics": metrics,
         "plot": plot_path,
@@ -1537,13 +1555,14 @@ def main() -> None:
                 print(f"  ✓ CI-width thresholds:")
                 for thr in conf_width_thresholds:
                     key = f"ci_thr{thr:.1f}"
-                    cov = m.get(f"{key}_coverage_pct", float("nan"))
+                    cov = m.get(f"{key}_coverage_pct_of_total", float("nan"))
+                    cov_subset = m.get(f"{key}_coverage_pct_of_subset", float("nan"))
                     thr_mae = m.get(f"{key}_mae", float("nan"))
                     thr_r2 = m.get(f"{key}_r2", float("nan"))
                     thr_acc05 = m.get(f"{key}_acc05", float("nan"))
                     thr_acc10 = m.get(f"{key}_acc10", float("nan"))
                     print(
-                        f"    ≤{thr:.1f}: coverage={cov:.1f}% "
+                        f"    ≤{thr:.1f}: coverage={cov:.1f}% of total ({cov_subset:.1f}% of non-ref) "
                         f"MAE={thr_mae:.4f} R²={thr_r2:.4f} Acc@0.5={thr_acc05:.1f}% Acc@1.0={thr_acc10:.1f}%"
                     )
                 
@@ -1554,7 +1573,8 @@ def main() -> None:
                     if key in m:
                         cov_info = m[key]
                         n_sel = cov_info["n_samples"]
-                        cov_pct_actual = cov_info["coverage_pct"]
+                        cov_pct_subset = cov_info["coverage_pct_of_subset"]
+                        cov_pct_total = cov_info["coverage_pct_of_total"]
                         mae = cov_info["mae"]
                         r2 = cov_info["r2"]
                         acc05 = cov_info["acc05"]
@@ -1562,7 +1582,7 @@ def main() -> None:
                         ci_width_mean = cov_info["ci_width_mean"]
                         empirical_cov = cov_info["ci_empirical_coverage_pct"]
                         print(
-                            f"    Top {cov_pct*100:.0f}%: n={n_sel} coverage={cov_pct_actual:.1f}% "
+                            f"    Top {cov_pct*100:.0f}% of non-ref: n={n_sel} ({cov_pct_total:.1f}% of total) "
                             f"MAE={mae:.4f} R²={r2:.4f} Acc@0.5={acc05:.1f}% Acc@1.0={acc10:.1f}% "
                             f"CI-width={ci_width_mean:.3f} empirical-cov={empirical_cov:.1f}%"
                         )
@@ -1603,13 +1623,13 @@ def main() -> None:
             key = f"ci_thr{thr:.1f}"
             valid = [r["metrics"] for r in all_results if not np.isnan(r["metrics"].get(f"{key}_mae", float("nan")))]
             if valid:
-                avg_thr_cov = float(np.mean([m[f"{key}_coverage_pct"] for m in valid]))
+                avg_thr_cov = float(np.mean([m[f"{key}_coverage_pct_of_total"] for m in valid]))
                 avg_thr_mae = float(np.mean([m[f"{key}_mae"] for m in valid]))
                 avg_thr_r2 = float(np.mean([m[f"{key}_r2"] for m in valid]))
                 avg_thr_acc05 = float(np.mean([m[f"{key}_acc05"] for m in valid]))
                 print(
                     f"SUMMARY - CI-width ≤{thr:.1f}:"
-                    f"  AVG coverage={avg_thr_cov:.1f}% | MAE={avg_thr_mae:.4f} | R²={avg_thr_r2:.4f} | Acc@0.5={avg_thr_acc05:.1f}%\n"
+                    f"  AVG coverage={avg_thr_cov:.1f}% of total | MAE={avg_thr_mae:.4f} | R²={avg_thr_r2:.4f} | Acc@0.5={avg_thr_acc05:.1f}%\n"
                 )
         
         for cov_pct in coverage_thresholds:
@@ -1623,7 +1643,7 @@ def main() -> None:
                 avg_cov_ci_width = float(np.mean([m["ci_width_mean"] for m in valid_cov]))
                 avg_cov_empirical = float(np.mean([m["ci_empirical_coverage_pct"] for m in valid_cov]))
                 print(
-                    f"SUMMARY - Top {cov_pct*100:.0f}% samples:"
+                    f"SUMMARY - Top {cov_pct*100:.0f}% of non-ref samples:"
                     f"  AVG MAE={avg_cov_mae:.4f} | R²={avg_cov_r2:.4f} | Acc@0.5={avg_cov_acc05:.1f}% | Acc@1.0={avg_cov_acc10:.1f}% | "
                     f"CI-width={avg_cov_ci_width:.3f} | empirical-cov={avg_cov_empirical:.1f}%\n"
                 )
