@@ -387,6 +387,10 @@ def plot_pred_true_timeseries(
     plt.close()
 
 
+UCL_POSTMET = 82.156794
+LCL_POSTMET = 79.843206
+
+
 def plot_postmet_timeseries(
     y_post_from_gt: np.ndarray,
     y_post_from_pred: np.ndarray,
@@ -400,9 +404,8 @@ def plot_postmet_timeseries(
     Scenario B — post_MET predicted from Stage-1 PREDICTED  PreMET (deployed)
     """
     x = np.arange(len(y_post_from_gt))
-    diff = y_post_from_pred - y_post_from_gt
 
-    fig, axes = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
+    fig, ax = plt.subplots(1, 1, figsize=(18, 6))
     fig.suptitle(
         f"PostMET Prediction — {dataset_name}\n"
         f"Predicted-PreMET vs Groundtruth-PreMET pipeline:  "
@@ -411,28 +414,29 @@ def plot_postmet_timeseries(
         fontsize=11,
     )
 
-    ax = axes[0]
-    ax.plot(x, y_post_from_gt, color="black", linewidth=1.2, alpha=0.7,
+    # Scenario A: groundtruth PreMET → post_MET (blue)
+    ax.fill_between(x, y_post_from_gt - 0.35, y_post_from_gt + 0.35,
+                    alpha=0.18, color="lightblue", label="±0.35 band (Scenario A)")
+    ax.plot(x, y_post_from_gt, color="blue", linewidth=1.2, alpha=0.8,
             label="post_MET (Scenario A — groundtruth PreMET)")
-    ax.plot(x, y_post_from_pred, color="tomato", linewidth=1.2, alpha=0.85, linestyle="--",
-            label="post_MET (Scenario B — predicted PreMET)")
-    ax.fill_between(x, y_post_from_gt - 0.5, y_post_from_gt + 0.5, alpha=0.08, color="green",
-                    label="±0.5 band around Scenario A")
-    ax.set_ylabel("post_MET")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.25)
-    ax.set_title("Predicted post_MET: groundtruth-PreMET (reference) vs predicted-PreMET")
 
-    ax = axes[1]
-    ax.plot(x, diff, color="steelblue", linewidth=1.0, alpha=0.8,
-            label="Scenario B − Scenario A")
-    ax.axhline(0, color="black", linestyle="--", linewidth=1)
-    ax.fill_between(x, -0.5, 0.5, alpha=0.08, color="green", label="±0.5 band")
+    # Scenario B: predicted PreMET → post_MET (green)
+    ax.fill_between(x, y_post_from_pred - 0.35, y_post_from_pred + 0.35,
+                    alpha=0.18, color="lightgreen", label="±0.35 band (Scenario B)")
+    ax.plot(x, y_post_from_pred, color="green", linewidth=1.2, alpha=0.85, linestyle="--",
+            label="post_MET (Scenario B — predicted PreMET)")
+
+    # UCL / LCL control lines
+    ax.axhline(UCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
+               label=f"UCL={UCL_POSTMET}")
+    ax.axhline(LCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
+               label=f"LCL={LCL_POSTMET}")
+
     ax.set_xlabel("test sample index (time order)")
-    ax.set_ylabel("Δ post_MET")
+    ax.set_ylabel("post_MET")
+    ax.set_title("Predicted post_MET: groundtruth-PreMET (reference) vs predicted-PreMET")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
-    ax.set_title("Difference between the two predicted post_MET curves")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
