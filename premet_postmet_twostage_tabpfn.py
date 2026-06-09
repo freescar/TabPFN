@@ -1651,7 +1651,7 @@ def run_stage2_postmet(
     del postmet_model
     force_cleanup(light=True)
 
-    def _nan_metrics() -> dict:
+    def _nan_metrics() -> dict[str, float]:
         return {
             "mae": float("nan"),
             "rmse": float("nan"),

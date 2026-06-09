@@ -5,6 +5,7 @@ import math
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -54,10 +55,10 @@ def test_stage2_inference_does_not_require_true_postmet() -> None:
 
     infer_inputs: list[np.ndarray] = []
 
-    def fake_train(*args, **kwargs):  # noqa: ANN002, ANN003
+    def mock_train_postmet_model(*args: Any, **kwargs: Any):
         return object(), object(), object(), 0.01
 
-    def fake_infer(
+    def mock_infer_postmet(
         _model,
         _le_tool,
         _le_slot,
@@ -68,8 +69,8 @@ def test_stage2_inference_does_not_require_true_postmet() -> None:
         infer_inputs.append(pre_met_values.copy())
         return pre_met_values + 0.5
 
-    mod.train_postmet_model = fake_train
-    mod.infer_postmet = fake_infer
+    mod.train_postmet_model = mock_train_postmet_model
+    mod.infer_postmet = mock_infer_postmet
 
     result = mod.run_stage2_postmet(
         stage1_result=stage1_result,
@@ -118,10 +119,10 @@ def test_stage2_uses_true_postmet_only_for_eval_mask() -> None:
 
     infer_lengths: list[int] = []
 
-    def fake_train(*args, **kwargs):  # noqa: ANN002, ANN003
+    def mock_train_postmet_model(*args: Any, **kwargs: Any):
         return object(), object(), object(), 0.01
 
-    def fake_infer(
+    def mock_infer_postmet(
         _model,
         _le_tool,
         _le_slot,
@@ -132,8 +133,8 @@ def test_stage2_uses_true_postmet_only_for_eval_mask() -> None:
         infer_lengths.append(len(pre_met_values))
         return pre_met_values + 0.2
 
-    mod.train_postmet_model = fake_train
-    mod.infer_postmet = fake_infer
+    mod.train_postmet_model = mock_train_postmet_model
+    mod.infer_postmet = mock_infer_postmet
     mod.plot_postmet_timeseries = lambda **kwargs: None
     mod.plot_postmet_scatter = lambda **kwargs: None
 
