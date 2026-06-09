@@ -388,184 +388,130 @@ def plot_pred_true_timeseries(
 
 
 def plot_postmet_timeseries(
-    y_post_true: np.ndarray,
-    y_post_pred_A: np.ndarray,
-    y_post_pred_B: np.ndarray,
-    metrics_A: dict,
-    metrics_B: dict,
+    y_post_from_gt: np.ndarray,
+    y_post_from_pred: np.ndarray,
+    metrics: dict,
     out_path: str,
     dataset_name: str,
 ) -> None:
-    """PostMET time-series comparing two scenarios."""
-    x = np.arange(len(y_post_true))
+    """PostMET time-series comparing the two predicted curves.
+
+    Scenario A — post_MET predicted from GROUNDTRUTH PreMET (reference)
+    Scenario B — post_MET predicted from Stage-1 PREDICTED  PreMET (deployed)
+    """
+    x = np.arange(len(y_post_from_gt))
+    diff = y_post_from_pred - y_post_from_gt
+
     fig, axes = plt.subplots(2, 1, figsize=(18, 10), sharex=True)
     fig.suptitle(
         f"PostMET Prediction — {dataset_name}\n"
-        f"Scenario A (actual PreMET input): MAE={metrics_A['mae']:.4f}  "
-        f"R²={metrics_A['r2']:.4f}  Acc@0.5={metrics_A['acc05']:.1f}%  "
-        f"Acc@1.0={metrics_A['acc10']:.1f}%\n"
-        f"Scenario B (predicted PreMET input): MAE={metrics_B['mae']:.4f}  "
-        f"R²={metrics_B['r2']:.4f}  Acc@0.5={metrics_B['acc05']:.1f}%  "
-        f"Acc@1.0={metrics_B['acc10']:.1f}%",
+        f"Predicted-PreMET vs Groundtruth-PreMET pipeline:  "
+        f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.4f}  "
+        f"Acc@0.5={metrics['acc05']:.1f}%  Acc@1.0={metrics['acc10']:.1f}%",
         fontsize=11,
     )
 
     ax = axes[0]
-    ax.plot(x, y_post_true, color="black", linewidth=1.0, alpha=0.5, label="actual post_MET")
-    ax.plot(x, y_post_pred_A, color="steelblue", linewidth=1.2, alpha=0.8, linestyle="--",
-            label="pred (Scenario A — actual PreMET)")
-    ax.fill_between(x, y_post_true - 0.5, y_post_true + 0.5, alpha=0.08, color="green",
-                    label="±0.5 band")
+    ax.plot(x, y_post_from_gt, color="black", linewidth=1.2, alpha=0.7,
+            label="post_MET (Scenario A — groundtruth PreMET)")
+    ax.plot(x, y_post_from_pred, color="tomato", linewidth=1.2, alpha=0.85, linestyle="--",
+            label="post_MET (Scenario B — predicted PreMET)")
+    ax.fill_between(x, y_post_from_gt - 0.5, y_post_from_gt + 0.5, alpha=0.08, color="green",
+                    label="±0.5 band around Scenario A")
     ax.set_ylabel("post_MET")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
-    ax.set_title("Scenario A: PostMET predicted using actual PreMET as input feature")
+    ax.set_title("Predicted post_MET: groundtruth-PreMET (reference) vs predicted-PreMET")
 
     ax = axes[1]
-    ax.plot(x, y_post_true, color="black", linewidth=1.0, alpha=0.5, label="actual post_MET")
-    ax.plot(x, y_post_pred_B, color="tomato", linewidth=1.2, alpha=0.8, linestyle="--",
-            label="pred (Scenario B — predicted PreMET)")
-    ax.fill_between(x, y_post_true - 0.5, y_post_true + 0.5, alpha=0.08, color="green",
-                    label="±0.5 band")
+    ax.plot(x, diff, color="steelblue", linewidth=1.0, alpha=0.8,
+            label="Scenario B − Scenario A")
+    ax.axhline(0, color="black", linestyle="--", linewidth=1)
+    ax.fill_between(x, -0.5, 0.5, alpha=0.08, color="green", label="±0.5 band")
     ax.set_xlabel("test sample index (time order)")
-    ax.set_ylabel("post_MET")
+    ax.set_ylabel("Δ post_MET")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
-    ax.set_title("Scenario B: PostMET predicted using Stage-1 predicted PreMET as input feature")
+    ax.set_title("Difference between the two predicted post_MET curves")
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
     plt.close()
 
-
 def plot_postmet_scatter(
-    y_post_true: np.ndarray,
-    y_post_pred_A: np.ndarray,
-    y_post_pred_B: np.ndarray,
-    metrics_A: dict,
-    metrics_B: dict,
+    y_post_from_gt: np.ndarray,
+    y_post_from_pred: np.ndarray,
+    metrics: dict,
     loop_counts: Optional[np.ndarray],
-    loop_metrics_A: dict,
-    loop_metrics_B: dict,
+    loop_metrics: dict,
     out_path: str,
     dataset_name: str,
 ) -> None:
-    """PostMET scatter + error distribution + loop-count metrics."""
-    n_rows = 2
-    n_cols = 3
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 10))
+    """PostMET scatter + difference distribution + per-loop-count metrics,
+    comparing the two predicted post_MET curves (predicted-PreMET vs
+    groundtruth-PreMET)."""
+    res = y_post_from_pred - y_post_from_gt
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle(f"PostMET Analysis — {dataset_name}", fontsize=13, fontweight="bold")
 
-    # Scatter A
+    # Scatter: Scenario A (x) vs Scenario B (y)
     ax = axes[0, 0]
-    ax.scatter(y_post_true, y_post_pred_A, s=8, alpha=0.5, color="steelblue")
-    lo = min(y_post_true.min(), y_post_pred_A.min())
-    hi = max(y_post_true.max(), y_post_pred_A.max())
+    ax.scatter(y_post_from_gt, y_post_from_pred, s=8, alpha=0.5, color="steelblue")
+    lo = float(min(y_post_from_gt.min(), y_post_from_pred.min()))
+    hi = float(max(y_post_from_gt.max(), y_post_from_pred.max()))
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5)
-    ax.set_xlabel("Actual post_MET")
-    ax.set_ylabel("Predicted post_MET")
+    ax.set_xlabel("post_MET (Scenario A — groundtruth PreMET)")
+    ax.set_ylabel("post_MET (Scenario B — predicted PreMET)")
     ax.set_title(
-        f"Scenario A (actual PreMET)\nMAE={metrics_A['mae']:.4f}  R²={metrics_A['r2']:.4f}",
+        f"Predicted-PreMET vs Groundtruth-PreMET\n"
+        f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.4f}",
         fontsize=10,
     )
     ax.grid(alpha=0.25)
 
-    # Scatter B
+    # Difference distribution
     ax = axes[0, 1]
-    ax.scatter(y_post_true, y_post_pred_B, s=8, alpha=0.5, color="tomato")
-    lo = min(y_post_true.min(), y_post_pred_B.min())
-    hi = max(y_post_true.max(), y_post_pred_B.max())
-    ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5)
-    ax.set_xlabel("Actual post_MET")
-    ax.set_ylabel("Predicted post_MET")
-    ax.set_title(
-        f"Scenario B (predicted PreMET)\nMAE={metrics_B['mae']:.4f}  R²={metrics_B['r2']:.4f}",
-        fontsize=10,
-    )
-    ax.grid(alpha=0.25)
-
-    # Residual distributions
-    ax = axes[0, 2]
-    res_A = y_post_true - y_post_pred_A
-    res_B = y_post_true - y_post_pred_B
-    bins = np.linspace(
-        min(res_A.min(), res_B.min()), max(res_A.max(), res_B.max()), 30
-    )
-    ax.hist(res_A, bins=bins, alpha=0.5, color="steelblue", label=f"A (mean={res_A.mean():.3f})")
-    ax.hist(res_B, bins=bins, alpha=0.5, color="tomato", label=f"B (mean={res_B.mean():.3f})")
+    ax.hist(res, bins=30, alpha=0.7, color="tomato", label=f"mean={res.mean():.3f}")
     ax.axvline(0, color="black", linestyle="--", linewidth=1)
-    ax.set_xlabel("Residual (actual − predicted)")
+    ax.set_xlabel("Δ post_MET (Scenario B − Scenario A)")
     ax.set_ylabel("Count")
-    ax.set_title("Residual Distribution Comparison", fontsize=10)
+    ax.set_title("Difference Distribution", fontsize=10)
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25, axis="y")
 
-    # Absolute error over samples
+    # Absolute difference over samples
     ax = axes[1, 0]
-    x = np.arange(len(y_post_true))
-    ax.plot(x, np.abs(res_A), color="steelblue", linewidth=0.8, alpha=0.7, label="AE (A)")
-    ax.plot(x, np.abs(res_B), color="tomato", linewidth=0.8, alpha=0.7, label="AE (B)")
-    ax.axhline(metrics_A["mae"], color="steelblue", linestyle="--", linewidth=1.2,
-               label=f"MAE A={metrics_A['mae']:.4f}")
-    ax.axhline(metrics_B["mae"], color="tomato", linestyle="--", linewidth=1.2,
-               label=f"MAE B={metrics_B['mae']:.4f}")
+    x = np.arange(len(y_post_from_gt))
+    ax.plot(x, np.abs(res), color="steelblue", linewidth=0.8, alpha=0.7, label="|Δ post_MET|")
+    ax.axhline(metrics["mae"], color="tomato", linestyle="--", linewidth=1.2,
+               label=f"MAE={metrics['mae']:.4f}")
     ax.set_xlabel("Sample index")
-    ax.set_ylabel("Absolute Error")
-    ax.set_title("Absolute Error over Samples", fontsize=10)
+    ax.set_ylabel("Absolute Difference")
+    ax.set_title("Absolute Difference over Samples", fontsize=10)
     ax.legend(fontsize=8)
     ax.grid(alpha=0.25)
 
-    # Per-loop-count MAE bar chart (Scenario A vs B)
+    # Per-loop-count MAE (grouped by groundtruth loop)
     ax = axes[1, 1]
-    if loop_metrics_A and loop_metrics_B:
-        lc_keys = sorted(
-            set(loop_metrics_A.keys()) & set(loop_metrics_B.keys()),
-            key=lambda k: int(k.split("_")[1]),
-        )
+    if loop_metrics:
+        lc_keys = sorted(loop_metrics.keys(), key=lambda k: int(k.split("_")[1]))
         lc_labels = [k.replace("loop_", "lc=") for k in lc_keys]
-        mae_A_vals = [loop_metrics_A[k]["mae"] for k in lc_keys]
-        mae_B_vals = [loop_metrics_B[k]["mae"] for k in lc_keys]
+        mae_vals = [loop_metrics[k]["mae"] for k in lc_keys]
         xpos = np.arange(len(lc_keys))
-        width = 0.35
-        bars_a = ax.bar(xpos - width / 2, mae_A_vals, width, color="steelblue", alpha=0.8, label="A")
-        bars_b = ax.bar(xpos + width / 2, mae_B_vals, width, color="tomato", alpha=0.8, label="B")
+        ax.bar(xpos, mae_vals, 0.6, color="steelblue", alpha=0.85)
         ax.set_xticks(xpos)
         ax.set_xticklabels(lc_labels, rotation=30, ha="right", fontsize=8)
-        ax.set_ylabel("MAE")
-        ax.set_title("Per-Loop-Count MAE: Scenario A vs B", fontsize=10)
-        ax.legend(fontsize=9)
+        ax.set_ylabel("MAE (B vs A)")
+        ax.set_title("Per-Loop-Count MAE (grouped by groundtruth loop)", fontsize=10)
         ax.grid(alpha=0.25, axis="y")
     else:
         ax.axis("off")
         ax.text(0.5, 0.5, "loop_count metrics\nnot available",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12)
 
-    # Metrics summary text
-    ax = axes[1, 2]
-    ax.axis("off")
-    summary = (
-        f"PostMET Metrics Summary\n\n"
-        f"{'Metric':<18} {'Scenario A':>14} {'Scenario B':>14}\n"
-        f"{'':─<48}\n"
-        f"{'MAE':<18} {metrics_A['mae']:>14.4f} {metrics_B['mae']:>14.4f}\n"
-        f"{'RMSE':<18} {metrics_A['rmse']:>14.4f} {metrics_B['rmse']:>14.4f}\n"
-        f"{'R²':<18} {metrics_A['r2']:>14.4f} {metrics_B['r2']:>14.4f}\n"
-        f"{'Acc@0.5 (%)':<18} {metrics_A['acc05']:>14.1f} {metrics_B['acc05']:>14.1f}\n"
-        f"{'Acc@1.0 (%)':<18} {metrics_A['acc10']:>14.1f} {metrics_B['acc10']:>14.1f}\n\n"
-        f"Scenario A: postmet model input = actual PreMET\n"
-        f"Scenario B: postmet model input = Stage-1 predicted PreMET\n\n"
-        f"n_test = {len(y_post_true)}"
-    )
-    ax.text(
-        0.05, 0.95, summary, transform=ax.transAxes, fontsize=9.5,
-        verticalalignment="top", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.9, linewidth=1.5),
-    )
-
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
     plt.close()
-
 
 # ============================================================
 # Slot / reference-MET feature engineering  (Stage 1)
@@ -1587,23 +1533,27 @@ def infer_postmet(
     le_slot: LabelEncoder,
     df_test: pd.DataFrame,
     pre_met_values: np.ndarray,
+    loop_count_values: np.ndarray,
     *,
     tool_col: str,
-    loop_count_col: str,
     slot_col: str,
 ) -> np.ndarray:
-    """Run postmet inference given a custom pre_met_values array.
+    """Run postmet inference given custom pre_MET and loop_count arrays.
 
+    pre_met_values and loop_count_values must be aligned with df_test rows.
     Returns predicted post_MET = pre_met_values + delta_MET_pred.
     """
+    pre_met_values = np.asarray(pre_met_values, dtype=np.float32)
+    loop_count_values = np.asarray(loop_count_values, dtype=np.float32)
+
     tool_enc = _safe_label_encode(le_tool, df_test[tool_col].astype(str).values)
     slot_enc = _safe_label_encode(le_slot, df_test[slot_col].astype(str).values)
 
     X_infer = pd.DataFrame({
         "tool_encoded": tool_enc,
         "slot_encoded": slot_enc,
-        "pre_MET": pre_met_values.astype(np.float32),
-        "loop_count": df_test[loop_count_col].astype(np.float32).values,
+        "pre_MET": pre_met_values,
+        "loop_count": loop_count_values,
     })
 
     delta_pred = postmet_model.predict(X_infer).astype(np.float32)
@@ -1632,46 +1582,39 @@ def run_stage2_postmet(
 ) -> Optional[dict]:
     """Run Stage-2 PostMET.
 
-    premet_col_in_test: column in stage1_result['df_test'] that holds the actual
-                        premet measurement (used as pre_MET feature, Scenario A).
-                        Typically equals the Stage-1 target_col.
+    No actual post_MET ground truth is required in the PreMET test set.
+    Two post_MET curves are predicted by the Stage-2 model and compared:
+
+      • Scenario A (reference): pre_MET = Stage-1 GROUNDTRUTH PreMET,
+        loop_count = ocd_to_loop(groundtruth PreMET)
+      • Scenario B (deployed):  pre_MET = Stage-1 PREDICTED  PreMET,
+        loop_count = ocd_to_loop(predicted  PreMET)
+
+    Metrics measure the agreement of Scenario B (deployed) against
+    Scenario A (groundtruth reference).
     """
     df_test = stage1_result["df_test"]
     y_pred_premet = stage1_result["y_pred"]   # Stage-1 predicted premet
 
-    # Check required columns in the test set
-    required_test_cols = [
-        premet_col_in_test, postmet_tool_col, postmet_loop_count_col, postmet_slot_col
-    ]
-
-    
-    if "loop_count" not in df_test.columns:
-        print(f" loop_count not in stage1 results, calculate it") 
-        predicted_loop = ocd_to_loop(y_pred_premet).astype(int)
-        df_test["loop_count"] = predicted_loop
-        loop_dist = pd.Series(predicted_loop).value_counts().sort_index()
-        print(f"    预测 loop 分布: {dict(loop_dist)}")
-
-
+    # Stage-2 only needs tool + slot from the test set; pre_MET and loop_count
+    # are derived from Stage-1 groundtruth / predicted PreMET, so the actual
+    # post_MET column is NOT required here.
+    required_test_cols = [premet_col_in_test, postmet_tool_col, postmet_slot_col]
     missing = [c for c in required_test_cols if c not in df_test.columns]
     if missing:
         print(
             f"  ⚠️  [Stage-2] skip: premet test set missing columns {missing}. "
-            f"Stage-2 requires the premet dataset to also contain "
-            f"{required_test_cols}"
+            f"Stage-2 requires the premet dataset to contain {required_test_cols}"
         )
         return None
 
-    # Actual pre_MET from test set (= Stage-1 target values)
+    # Groundtruth PreMET (= Stage-1 target values) and Stage-1 predicted PreMET
     pre_met_actual = df_test[premet_col_in_test].astype(np.float32).values
-    # Stage-1 predicted pre_MET
     pre_met_predicted = y_pred_premet.astype(np.float32)
-    # Inference mask: only depends on pre_MET inputs (actual + predicted)
+
     valid_infer = np.isfinite(pre_met_actual) & np.isfinite(pre_met_predicted)
     if valid_infer.sum() < 10:
-        print(
-            f"  ⚠️  [Stage-2] skip: too few valid rows ({valid_infer.sum()}) in test set."
-        )
+        print(f"  ⚠️  [Stage-2] skip: too few valid rows ({valid_infer.sum()}) in test set.")
         return None
     if valid_infer.sum() < len(valid_infer):
         print(
@@ -1683,7 +1626,17 @@ def run_stage2_postmet(
     pre_met_actual = pre_met_actual[valid_infer]
     pre_met_predicted = pre_met_predicted[valid_infer]
 
-    loop_counts = df_test_valid[postmet_loop_count_col].values
+    # Separately derive loop_count from groundtruth and predicted PreMET (OCD → loop)
+    loop_count_actual = ocd_to_loop(pre_met_actual, out_of_range="clip").astype(int)
+    loop_count_predicted = ocd_to_loop(pre_met_predicted, out_of_range="clip").astype(int)
+    print(
+        f"  [Stage-2] loop_count from GROUNDTRUTH PreMET: "
+        f"{dict(pd.Series(loop_count_actual).value_counts().sort_index())}"
+    )
+    print(
+        f"  [Stage-2] loop_count from PREDICTED  PreMET: "
+        f"{dict(pd.Series(loop_count_predicted).value_counts().sort_index())}"
+    )
 
     # Train postmet model on ALL postmet training data
     postmet_model, le_tool, le_slot, train_time = train_postmet_model(
@@ -1702,20 +1655,20 @@ def run_stage2_postmet(
     )
 
     t0 = time.time()
-    # Scenario A: use actual pre_MET → "ideal" postmet prediction
-    y_post_pred_A = infer_postmet(
+    # Scenario A (reference): groundtruth PreMET + loop_count(groundtruth)
+    y_post_from_gt = infer_postmet(
         postmet_model, le_tool, le_slot, df_test_valid,
         pre_met_values=pre_met_actual,
+        loop_count_values=loop_count_actual,
         tool_col=postmet_tool_col,
-        loop_count_col=postmet_loop_count_col,
         slot_col=postmet_slot_col,
     )
-    # Scenario B: use Stage-1 predicted pre_MET → "deployed" postmet prediction
-    y_post_pred_B = infer_postmet(
+    # Scenario B (deployed): predicted PreMET + loop_count(predicted)
+    y_post_from_pred = infer_postmet(
         postmet_model, le_tool, le_slot, df_test_valid,
         pre_met_values=pre_met_predicted,
+        loop_count_values=loop_count_predicted,
         tool_col=postmet_tool_col,
-        loop_count_col=postmet_loop_count_col,
         slot_col=postmet_slot_col,
     )
     t_infer = time.time() - t0
@@ -1723,104 +1676,50 @@ def run_stage2_postmet(
     del postmet_model
     force_cleanup(light=True)
 
-    def _nan_metrics() -> dict[str, float]:
-        return {
-            "mae": float("nan"),
-            "rmse": float("nan"),
-            "r2": float("nan"),
-            "acc05": float("nan"),
-            "acc10": float("nan"),
-        }
-
-    metrics_A = _nan_metrics()
-    metrics_B = _nan_metrics()
-    loop_metrics_A = {}
-    loop_metrics_B = {}
-    n_eval = 0
+    # Compare the two predicted post_MET curves. Scenario A (groundtruth-PreMET)
+    # is the reference ("true"); Scenario B (predicted-PreMET) is the prediction.
+    metrics = eval_metrics(y_post_from_gt, y_post_from_pred)
+    loop_metrics = eval_metrics_by_loop_count(
+        y_post_from_gt, y_post_from_pred, loop_count_actual
+    )
 
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_ts_path = os.path.join(output_dir, f"{safe}_postmet_timeseries.png")
     plot_scatter_path = os.path.join(output_dir, f"{safe}_postmet_scatter.png")
 
-    if postmet_post_met_col in df_test_valid.columns:
-        y_post_true = df_test_valid[postmet_post_met_col].astype(np.float32).values
-        eval_mask = np.isfinite(y_post_true)
-        n_eval = int(eval_mask.sum())
-        if n_eval < 10:
-            print(
-                f"  [Stage-2] Warning: too few valid post_MET rows for evaluation ({n_eval}). "
-                "Skipping Stage-2 PostMET metrics/plots."
-            )
-        else:
-            if n_eval < len(eval_mask):
-                print(
-                    f"  [Stage-2] Warning: {(~eval_mask).sum()} rows have NaN true post_MET — "
-                    "excluded from Stage-2 evaluation only."
-                )
-            y_post_true_eval = y_post_true[eval_mask]
-            y_post_pred_A_eval = y_post_pred_A[eval_mask]
-            y_post_pred_B_eval = y_post_pred_B[eval_mask]
-            loop_counts_eval = loop_counts[eval_mask]
-
-            metrics_A = eval_metrics(y_post_true_eval, y_post_pred_A_eval)
-            metrics_B = eval_metrics(y_post_true_eval, y_post_pred_B_eval)
-            loop_metrics_A = eval_metrics_by_loop_count(
-                y_post_true_eval, y_post_pred_A_eval, loop_counts_eval
-            )
-            loop_metrics_B = eval_metrics_by_loop_count(
-                y_post_true_eval, y_post_pred_B_eval, loop_counts_eval
-            )
-
-            plot_postmet_timeseries(
-                y_post_true=y_post_true_eval,
-                y_post_pred_A=y_post_pred_A_eval,
-                y_post_pred_B=y_post_pred_B_eval,
-                metrics_A=metrics_A,
-                metrics_B=metrics_B,
-                out_path=plot_ts_path,
-                dataset_name=dataset_name,
-            )
-            plot_postmet_scatter(
-                y_post_true=y_post_true_eval,
-                y_post_pred_A=y_post_pred_A_eval,
-                y_post_pred_B=y_post_pred_B_eval,
-                metrics_A=metrics_A,
-                metrics_B=metrics_B,
-                loop_counts=loop_counts_eval,
-                loop_metrics_A=loop_metrics_A,
-                loop_metrics_B=loop_metrics_B,
-                out_path=plot_scatter_path,
-                dataset_name=dataset_name,
-            )
-    else:
-        print(
-            f"  [Stage-2] Warning: '{postmet_post_met_col}' not found in test set. "
-            "Inference completed for Scenario A/B; evaluation and plots skipped."
-        )
-        plot_ts_path = ""
-        plot_scatter_path = ""
+    plot_postmet_timeseries(
+        y_post_from_gt=y_post_from_gt,
+        y_post_from_pred=y_post_from_pred,
+        metrics=metrics,
+        out_path=plot_ts_path,
+        dataset_name=dataset_name,
+    )
+    plot_postmet_scatter(
+        y_post_from_gt=y_post_from_gt,
+        y_post_from_pred=y_post_from_pred,
+        metrics=metrics,
+        loop_counts=loop_count_actual,
+        loop_metrics=loop_metrics,
+        out_path=plot_scatter_path,
+        dataset_name=dataset_name,
+    )
 
     print(
         f"  [Stage-2] infer={t_infer:.1f}s | "
-        f"Scenario A (actual pre_MET): MAE={metrics_A['mae']:.4f} R²={metrics_A['r2']:.4f} "
-        f"Acc@0.5={metrics_A['acc05']:.1f}% | "
-        f"Scenario B (pred pre_MET): MAE={metrics_B['mae']:.4f} R²={metrics_B['r2']:.4f} "
-        f"Acc@0.5={metrics_B['acc05']:.1f}%"
+        f"PostMET agreement (predicted-PreMET vs groundtruth-PreMET): "
+        f"MAE={metrics['mae']:.4f} R²={metrics['r2']:.4f} "
+        f"Acc@0.5={metrics['acc05']:.1f}% Acc@1.0={metrics['acc10']:.1f}%"
     )
 
     return {
-        "postmet_metrics_A": metrics_A,
-        "postmet_metrics_B": metrics_B,
-        "loop_count_metrics_A": loop_metrics_A,
-        "loop_count_metrics_B": loop_metrics_B,
+        "postmet_metrics": metrics,
+        "loop_count_metrics": loop_metrics,
         "plot_timeseries": plot_ts_path,
         "plot_scatter": plot_scatter_path,
         "n_test": int(valid_infer.sum()),
-        "n_eval": int(n_eval),
         "train_time_sec": float(train_time),
         "infer_time_sec": float(t_infer),
     }
-
 
 # ============================================================
 # CLI helpers
@@ -2107,34 +2006,28 @@ def main() -> None:
                     poly_features=args.poly_features,
                     subsample_samples=args.subsample_samples,
                 )
+
                 if s2 is not None:
                     dataset_result["stage2"] = s2
 
-                    mA = s2["postmet_metrics_A"]
-                    mB = s2["postmet_metrics_B"]
+                    m2 = s2["postmet_metrics"]
                     print(
                         f"\n  ── Stage-2 PostMET Results ──\n"
                         f"  n_test = {s2['n_test']}\n"
-                        f"  Scenario A (actual PreMET):    "
-                        f"MAE={mA['mae']:.4f}  R²={mA['r2']:.4f}  "
-                        f"Acc@0.5={mA['acc05']:.1f}%  Acc@1.0={mA['acc10']:.1f}%\n"
-                        f"  Scenario B (predicted PreMET): "
-                        f"MAE={mB['mae']:.4f}  R²={mB['r2']:.4f}  "
-                        f"Acc@0.5={mB['acc05']:.1f}%  Acc@1.0={mB['acc10']:.1f}%"
+                        f"  PostMET agreement (predicted-PreMET vs groundtruth-PreMET):\n"
+                        f"    MAE={m2['mae']:.4f}  R²={m2['r2']:.4f}  "
+                        f"Acc@0.5={m2['acc05']:.1f}%  Acc@1.0={m2['acc10']:.1f}%"
                     )
-                    if s2["loop_count_metrics_A"]:
-                        print(f"  Loop-count metrics (Scenario A):")
+                    if s2["loop_count_metrics"]:
+                        print("  Loop-count metrics (grouped by groundtruth loop):")
                         for lk, lv in sorted(
-                            s2["loop_count_metrics_A"].items(),
+                            s2["loop_count_metrics"].items(),
                             key=lambda kv: int(kv[0].split("_")[1]),
                         ):
-                            mA_lc = s2["postmet_metrics_A"]
-                            lv_b = s2["loop_count_metrics_B"].get(lk, {})
                             print(
                                 f"    {lk}: n={lv['n_samples']}  "
-                                f"A: MAE={lv['mae']:.4f} Acc@0.5={lv['acc05']:.1f}%  "
-                                f"B: MAE={lv_b.get('mae', float('nan')):.4f} "
-                                f"Acc@0.5={lv_b.get('acc05', float('nan')):.1f}%"
+                                f"MAE={lv['mae']:.4f}  R²={lv['r2']:.4f}  "
+                                f"Acc@0.5={lv['acc05']:.1f}%"
                             )
 
             all_results.append(dataset_result)
@@ -2174,16 +2067,15 @@ def main() -> None:
 
     s2_results = [r for r in all_results if "stage2" in r]
     if s2_results:
-        avg_A_mae = float(np.mean([r["stage2"]["postmet_metrics_A"]["mae"] for r in s2_results]))
-        avg_A_r2 = float(np.mean([r["stage2"]["postmet_metrics_A"]["r2"] for r in s2_results]))
-        avg_B_mae = float(np.mean([r["stage2"]["postmet_metrics_B"]["mae"] for r in s2_results]))
-        avg_B_r2 = float(np.mean([r["stage2"]["postmet_metrics_B"]["r2"] for r in s2_results]))
+        avg_mae = float(np.mean([r["stage2"]["postmet_metrics"]["mae"] for r in s2_results]))
+        avg_r2 = float(np.mean([r["stage2"]["postmet_metrics"]["r2"] for r in s2_results]))
+        avg_acc05 = float(np.mean([r["stage2"]["postmet_metrics"]["acc05"] for r in s2_results]))
+        avg_acc10 = float(np.mean([r["stage2"]["postmet_metrics"]["acc10"] for r in s2_results]))
         print(
             f"[Stage-2 PostMET Summary]\n"
-            f"  Scenario A (actual PreMET):    "
-            f"AVG MAE={avg_A_mae:.4f}  AVG R²={avg_A_r2:.4f}\n"
-            f"  Scenario B (predicted PreMET): "
-            f"AVG MAE={avg_B_mae:.4f}  AVG R²={avg_B_r2:.4f}\n"
+            f"  PostMET agreement (predicted-PreMET vs groundtruth-PreMET):\n"
+            f"  AVG MAE={avg_mae:.4f}  AVG R²={avg_r2:.4f}  "
+            f"AVG Acc@0.5={avg_acc05:.1f}%  AVG Acc@1.0={avg_acc10:.1f}%\n"
         )
 
 
