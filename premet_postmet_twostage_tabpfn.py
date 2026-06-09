@@ -126,6 +126,68 @@ DEFAULT_CI_QUANTILE_UPPER = 0.9
 DEFAULT_CONF_WIDTH_THRESHOLDS = "0.5,1.0,1.5"
 DEFAULT_COVERAGE_THRESHOLDS = "0.10,0.20,0.30"
 
+FB_DC_TARGET1 = 81.0
+PRE_OFFSET = 0.3127
+REC1_GRADIENT = 0.1313
+LOOP_OFFSET = 6.0
+
+RUN_VALUE_BOUNDS = np.array([0.0, 19.5, 26.2, 33.0, 39.8, 46.5, 53.5, 60.1, 100.0], dtype=np.float64)
+CLASS_LABELS = np.arange(2, 10, dtype=int)
+
+
+# ============================================================
+# Loop 计算函数
+# ============================================================
+def ocd_to_run_value(ocd):
+    """OCD → run_value 转换"""
+    return (FB_DC_TARGET1 - np.asarray(ocd, dtype=np.float64) - PRE_OFFSET) / REC1_GRADIENT - LOOP_OFFSET
+
+
+def run_value_to_loop(rv, out_of_range="clip"):
+    """run_value → loop_count 转换"""
+    rv = np.asarray(rv, dtype=np.float64)
+    idx = np.searchsorted(RUN_VALUE_BOUNDS[1:-1], rv, side="right")
+    loop = CLASS_LABELS[np.clip(idx, 0, len(CLASS_LABELS) - 1)].astype(float)
+    if out_of_range == "nan":
+        loop[~((rv >= RUN_VALUE_BOUNDS[0]) & (rv < RUN_VALUE_BOUNDS[-1]))] = np.nan
+    return loop
+
+
+def ocd_to_loop(ocd, out_of_range="clip"):
+    """OCD → loop_count 直接转换"""
+    return run_value_to_loop(ocd_to_run_value(ocd), out_of_range=out_of_range)
+
+# ============================================================
+# 从 Stage-1 预测计算 loop_count
+# ============================================================
+def add_loop_count_from_predictions(df_test, y_pred, target_col="GroundTruth"):
+    """
+    在 df_test 中添加 loop_count 列
+    
+    Parameters
+    ----------
+    df_test : pd.DataFrame
+        Stage-1 test set (df_test from stage1_result)
+    y_pred : np.ndarray
+        Stage-1 预测值 (y_pred from stage1_result)
+    target_col : str
+        原始 OCD 列名
+    
+    Returns
+    -------
+    df_test : pd.DataFrame
+        包含 loop_count 列的更新后的 DataFrame
+    """
+    df_test = df_test.copy()
+    
+    # 从预测值计算 loop_count
+    predicted_loop = ocd_to_loop(y_pred, out_of_range="clip").astype(int)
+    df_test["loop_count"] = predicted_loop
+    
+    print(f"  [INFO] 已从 Stage-1 预测值计算 loop_count")
+    print(f"    预测 loop 分布: {dict(pd.Series(predicted_loop).value_counts().sort_index())}")
+    
+    return df_test
 
 # ============================================================
 # IO helpers
@@ -1581,6 +1643,16 @@ def run_stage2_postmet(
     required_test_cols = [
         premet_col_in_test, postmet_tool_col, postmet_loop_count_col, postmet_slot_col
     ]
+
+    
+    if "loop_count" not in df_test.columns:
+        print(f" loop_count not in stage1 results, calculate it") 
+        predicted_loop = ocd_to_loop(y_pred_premet).astype(int)
+        df_test["loop_count"] = predicted_loop
+        loop_dist = pd.Series(predicted_loop).value_counts().sort_index()
+        print(f"    预测 loop 分布: {dict(loop_dist)}")
+
+
     missing = [c for c in required_test_cols if c not in df_test.columns]
     if missing:
         print(
