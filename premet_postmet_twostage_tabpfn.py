@@ -1579,8 +1579,7 @@ def run_stage2_postmet(
 
     # Check required columns in the test set
     required_test_cols = [
-        premet_col_in_test, postmet_tool_col, postmet_loop_count_col,
-        postmet_slot_col, postmet_post_met_col,
+        premet_col_in_test, postmet_tool_col, postmet_loop_count_col, postmet_slot_col
     ]
     missing = [c for c in required_test_cols if c not in df_test.columns]
     if missing:
@@ -1595,28 +1594,22 @@ def run_stage2_postmet(
     pre_met_actual = df_test[premet_col_in_test].astype(np.float32).values
     # Stage-1 predicted pre_MET
     pre_met_predicted = y_pred_premet.astype(np.float32)
-    # Ground truth post_MET from test set
-    y_post_true = df_test[postmet_post_met_col].astype(np.float32).values
-
-    # Mask out NaN rows
-    valid = (
-        np.isfinite(pre_met_actual)
-        & np.isfinite(pre_met_predicted)
-        & np.isfinite(y_post_true)
-    )
-    if valid.sum() < 10:
-        print(f"  ⚠️  [Stage-2] skip: too few valid rows ({valid.sum()}) in test set.")
-        return None
-    if valid.sum() < len(valid):
+    # Inference mask: only depends on pre_MET inputs (actual + predicted)
+    valid_infer = np.isfinite(pre_met_actual) & np.isfinite(pre_met_predicted)
+    if valid_infer.sum() < 10:
         print(
-            f"  [Stage-2] Warning: {(~valid).sum()} test rows have NaN in "
-            "pre_MET / post_MET — excluding from Stage-2."
+            f"  ⚠️  [Stage-2] skip: too few valid rows ({valid_infer.sum()}) in test set."
+        )
+        return None
+    if valid_infer.sum() < len(valid_infer):
+        print(
+            f"  [Stage-2] Warning: {(~valid_infer).sum()} test rows have NaN in "
+            "pre_MET inputs — excluding from Stage-2 inference."
         )
 
-    df_test_valid = df_test[valid].reset_index(drop=True)
-    pre_met_actual = pre_met_actual[valid]
-    pre_met_predicted = pre_met_predicted[valid]
-    y_post_true = y_post_true[valid]
+    df_test_valid = df_test[valid_infer].reset_index(drop=True)
+    pre_met_actual = pre_met_actual[valid_infer]
+    pre_met_predicted = pre_met_predicted[valid_infer]
 
     loop_counts = df_test_valid[postmet_loop_count_col].values
 
@@ -1658,36 +1651,82 @@ def run_stage2_postmet(
     del postmet_model
     force_cleanup(light=True)
 
-    metrics_A = eval_metrics(y_post_true, y_post_pred_A)
-    metrics_B = eval_metrics(y_post_true, y_post_pred_B)
-    loop_metrics_A = eval_metrics_by_loop_count(y_post_true, y_post_pred_A, loop_counts)
-    loop_metrics_B = eval_metrics_by_loop_count(y_post_true, y_post_pred_B, loop_counts)
+    def _nan_metrics() -> dict[str, float]:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "acc05": float("nan"),
+            "acc10": float("nan"),
+        }
+
+    metrics_A = _nan_metrics()
+    metrics_B = _nan_metrics()
+    loop_metrics_A = {}
+    loop_metrics_B = {}
+    n_eval = 0
 
     safe = dataset_name.replace("/", "_").replace(" ", "_").replace(".", "_")
     plot_ts_path = os.path.join(output_dir, f"{safe}_postmet_timeseries.png")
     plot_scatter_path = os.path.join(output_dir, f"{safe}_postmet_scatter.png")
 
-    plot_postmet_timeseries(
-        y_post_true=y_post_true,
-        y_post_pred_A=y_post_pred_A,
-        y_post_pred_B=y_post_pred_B,
-        metrics_A=metrics_A,
-        metrics_B=metrics_B,
-        out_path=plot_ts_path,
-        dataset_name=dataset_name,
-    )
-    plot_postmet_scatter(
-        y_post_true=y_post_true,
-        y_post_pred_A=y_post_pred_A,
-        y_post_pred_B=y_post_pred_B,
-        metrics_A=metrics_A,
-        metrics_B=metrics_B,
-        loop_counts=loop_counts,
-        loop_metrics_A=loop_metrics_A,
-        loop_metrics_B=loop_metrics_B,
-        out_path=plot_scatter_path,
-        dataset_name=dataset_name,
-    )
+    if postmet_post_met_col in df_test_valid.columns:
+        y_post_true = df_test_valid[postmet_post_met_col].astype(np.float32).values
+        eval_mask = np.isfinite(y_post_true)
+        n_eval = int(eval_mask.sum())
+        if n_eval < 10:
+            print(
+                f"  [Stage-2] Warning: too few valid post_MET rows for evaluation ({n_eval}). "
+                "Skipping Stage-2 PostMET metrics/plots."
+            )
+        else:
+            if n_eval < len(eval_mask):
+                print(
+                    f"  [Stage-2] Warning: {(~eval_mask).sum()} rows have NaN true post_MET — "
+                    "excluded from Stage-2 evaluation only."
+                )
+            y_post_true_eval = y_post_true[eval_mask]
+            y_post_pred_A_eval = y_post_pred_A[eval_mask]
+            y_post_pred_B_eval = y_post_pred_B[eval_mask]
+            loop_counts_eval = loop_counts[eval_mask]
+
+            metrics_A = eval_metrics(y_post_true_eval, y_post_pred_A_eval)
+            metrics_B = eval_metrics(y_post_true_eval, y_post_pred_B_eval)
+            loop_metrics_A = eval_metrics_by_loop_count(
+                y_post_true_eval, y_post_pred_A_eval, loop_counts_eval
+            )
+            loop_metrics_B = eval_metrics_by_loop_count(
+                y_post_true_eval, y_post_pred_B_eval, loop_counts_eval
+            )
+
+            plot_postmet_timeseries(
+                y_post_true=y_post_true_eval,
+                y_post_pred_A=y_post_pred_A_eval,
+                y_post_pred_B=y_post_pred_B_eval,
+                metrics_A=metrics_A,
+                metrics_B=metrics_B,
+                out_path=plot_ts_path,
+                dataset_name=dataset_name,
+            )
+            plot_postmet_scatter(
+                y_post_true=y_post_true_eval,
+                y_post_pred_A=y_post_pred_A_eval,
+                y_post_pred_B=y_post_pred_B_eval,
+                metrics_A=metrics_A,
+                metrics_B=metrics_B,
+                loop_counts=loop_counts_eval,
+                loop_metrics_A=loop_metrics_A,
+                loop_metrics_B=loop_metrics_B,
+                out_path=plot_scatter_path,
+                dataset_name=dataset_name,
+            )
+    else:
+        print(
+            f"  [Stage-2] Warning: '{postmet_post_met_col}' not found in test set. "
+            "Inference completed for Scenario A/B; evaluation and plots skipped."
+        )
+        plot_ts_path = ""
+        plot_scatter_path = ""
 
     print(
         f"  [Stage-2] infer={t_infer:.1f}s | "
@@ -1704,7 +1743,8 @@ def run_stage2_postmet(
         "loop_count_metrics_B": loop_metrics_B,
         "plot_timeseries": plot_ts_path,
         "plot_scatter": plot_scatter_path,
-        "n_test": int(valid.sum()),
+        "n_test": int(valid_infer.sum()),
+        "n_eval": int(n_eval),
         "train_time_sec": float(train_time),
         "infer_time_sec": float(t_infer),
     }
