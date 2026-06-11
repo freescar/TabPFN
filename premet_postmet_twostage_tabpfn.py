@@ -79,6 +79,7 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 DEFAULT_PREMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/A2_DBJOA_BW09_Simple_Tabpfn_Tool01_CHA1.csv"
+# DEFAULT_PREMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_Simple_Tabpfn_Tools/"
 DEFAULT_POSTMET_DATA_PATH = "/ossfs/workspace/tools/A2_DBJOA_BW09_PLUS_20260101_20260601_merge_curr_pre_r2r_post_36tool.csv"          # required – path to a single postmet csv/parquet file
 
 DEFAULT_OUTPUT_DIR = "./results/twostage"
@@ -391,56 +392,141 @@ UCL_POSTMET = 82.156794
 LCL_POSTMET = 79.843206
 
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+UCL_POSTMET = 82.156794
+LCL_POSTMET = 79.843206
+
 def plot_postmet_timeseries(
     y_post_from_gt: np.ndarray,
     y_post_from_pred: np.ndarray,
     metrics: dict,
     out_path: str,
-    dataset_name: str,
+    dataset_name: str
 ) -> None:
     """PostMET time-series comparing the two predicted curves.
-
     Scenario A — post_MET predicted from GROUNDTRUTH PreMET (reference)
-    Scenario B — post_MET predicted from Stage-1 PREDICTED  PreMET (deployed)
+    Scenario B — post_MET predicted from Stage-1 PREDICTED PreMET (deployed)
     """
     x = np.arange(len(y_post_from_gt))
-
-    fig, ax = plt.subplots(1, 1, figsize=(18, 6))
+    
+    # Create figure with more modern styling
+    plt.style.use('default')
+    fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+    
+    # Set background color
+    fig.patch.set_facecolor('#f8f9fa')
+    ax.set_facecolor('#f8f9fa')
+    
+    # Main title with better formatting
     fig.suptitle(
-        f"PostMET Prediction — {dataset_name}\n"
-        f"Predicted-PreMET vs Groundtruth-PreMET pipeline:  "
-        f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.4f}  "
-        f"Acc@0.5={metrics['acc05']:.1f}%  Acc@1.0={metrics['acc10']:.1f}%",
-        fontsize=11,
+        f"PostMET Prediction — Predicted-PreMET vs Groundtruth-PreMET\n"
+        f"Test dataset name — {dataset_name}",
+        fontsize=14,
+        fontweight='bold'
     )
-
-    # Scenario A: groundtruth PreMET → post_MET (blue)
+    
+    # Scenario A: Groundtruth PreMET → post_MET (blue)
     ax.fill_between(x, y_post_from_gt - 0.35, y_post_from_gt + 0.35,
-                    alpha=0.18, color="lightblue", label="±0.35 band (Scenario A)")
-    ax.plot(x, y_post_from_gt, color="blue", linewidth=1.2, alpha=0.8,
-            label="post_MET (Scenario A — groundtruth PreMET)")
-
-    # Scenario B: predicted PreMET → post_MET (green)
+                    alpha=0.2, color="#4a90e2", label="±0.35 Band (Scenario A)")
+    ax.plot(x, y_post_from_gt, color="#2c5aa0", linewidth=2, alpha=0.9,
+            label="PostMET (Scenario A — Groundtruth PreMET)")
+    
+    # Scenario B: Predicted PreMET → post_MET (green)
     ax.fill_between(x, y_post_from_pred - 0.35, y_post_from_pred + 0.35,
-                    alpha=0.18, color="lightgreen", label="±0.35 band (Scenario B)")
-    ax.plot(x, y_post_from_pred, color="green", linewidth=1.2, alpha=0.85, linestyle="--",
-            label="post_MET (Scenario B — predicted PreMET)")
-
-    # UCL / LCL control lines
-    ax.axhline(UCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
-               label=f"UCL={UCL_POSTMET}")
-    ax.axhline(LCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
-               label=f"LCL={LCL_POSTMET}")
-
-    ax.set_xlabel("test sample index (time order)")
-    ax.set_ylabel("post_MET")
-    ax.set_title("Predicted post_MET: groundtruth-PreMET (reference) vs predicted-PreMET")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.25)
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120)
+                    alpha=0.2, color="#5cb85c", label="±0.35 Band (Scenario B)")
+    ax.plot(x, y_post_from_pred, color="#449d44", linewidth=2, alpha=0.9, linestyle='--',
+            label="PostMET (Scenario B — Predicted PreMET)")
+    
+    # UCL / LCL control lines with improved styling
+    ax.axhline(UCL_POSTMET, color="#d9534f", linewidth=2, linestyle='--', 
+               label=f"UCL={UCL_POSTMET:.2f}")
+    ax.axhline(LCL_POSTMET, color="#d9534f", linewidth=2, linestyle='--', 
+               label=f"LCL={LCL_POSTMET:.2f}")
+    
+    # Add target line (from reference image)
+    ax.axhline(81, color="#5bc0de", linewidth=1.5, linestyle=':', 
+               label="Target=81")
+    
+    # Axis labels and title
+    ax.set_xlabel("Test Sample Index (Time Order)", fontsize=12)
+    ax.set_ylabel("PostMET", fontsize=12)
+    ax.set_title("Predicted PostMET: Groundtruth-PreMET (Reference) vs Predicted-PreMET", 
+                 fontsize=13, fontweight='bold')
+    
+    # Configure grid
+    ax.grid(True, alpha=0.3, linestyle='-', color='lightgray')
+    
+    # Set y-axis limits to match reference image
+    ax.set_ylim(79.5, 82.5)
+    
+    # Configure legend with better positioning
+    legend = ax.legend(loc='upper right', fontsize=10, framealpha=0.9, 
+                      edgecolor='gray', fancybox=True)
+    legend.get_frame().set_facecolor('#f8f9fa')
+    
+    # Add grid lines at major intervals
+    ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+    ax.xaxis.grid(True, linestyle='--', alpha=0.5)
+    
+    # Adjust layout and save
+    plt.tight_layout(rect=[0, 0, 1, 0.95])  # Make room for title
+    plt.savefig(out_path, dpi=150, bbox_inches='tight', 
+                facecolor=fig.get_facecolor())
     plt.close()
+
+
+# def plot_postmet_timeseries(
+#     y_post_from_gt: np.ndarray,
+#     y_post_from_pred: np.ndarray,
+#     metrics: dict,
+#     out_path: str,
+#     dataset_name: str,
+# ) -> None:
+#     """PostMET time-series comparing the two predicted curves.
+
+#     Scenario A — post_MET predicted from GROUNDTRUTH PreMET (reference)
+#     Scenario B — post_MET predicted from Stage-1 PREDICTED  PreMET (deployed)
+#     """
+#     x = np.arange(len(y_post_from_gt))
+
+#     fig, ax = plt.subplots(1, 1, figsize=(18, 6))
+#     fig.suptitle(
+#         f"PostMET Prediction — {dataset_name}\n"
+#         f"Predicted-PreMET vs Groundtruth-PreMET pipeline:  "
+#         f"MAE={metrics['mae']:.4f}  R²={metrics['r2']:.4f}  "
+#         f"Acc@0.5={metrics['acc05']:.1f}%  Acc@1.0={metrics['acc10']:.1f}%",
+#         fontsize=11,
+#     )
+
+#     # Scenario A: groundtruth PreMET → post_MET (blue)
+#     ax.fill_between(x, y_post_from_gt - 0.35, y_post_from_gt + 0.35,
+#                     alpha=0.18, color="lightblue", label="±0.35 band (Scenario A)")
+#     ax.plot(x, y_post_from_gt, color="blue", linewidth=1.2, alpha=0.8,
+#             label="post_MET (Scenario A — groundtruth PreMET)")
+
+#     # Scenario B: predicted PreMET → post_MET (green)
+#     ax.fill_between(x, y_post_from_pred - 0.35, y_post_from_pred + 0.35,
+#                     alpha=0.18, color="lightgreen", label="±0.35 band (Scenario B)")
+#     ax.plot(x, y_post_from_pred, color="green", linewidth=1.2, alpha=0.85, linestyle="--",
+#             label="post_MET (Scenario B — predicted PreMET)")
+
+#     # UCL / LCL control lines
+#     ax.axhline(UCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
+#                label=f"UCL={UCL_POSTMET}")
+#     ax.axhline(LCL_POSTMET, color="yellow", linewidth=1.5, linestyle="--",
+#                label=f"LCL={LCL_POSTMET}")
+
+#     ax.set_xlabel("test sample index (time order)")
+#     ax.set_ylabel("post_MET")
+#     ax.set_title("Predicted post_MET: groundtruth-PreMET (reference) vs predicted-PreMET")
+#     ax.legend(fontsize=9)
+#     ax.grid(alpha=0.25)
+
+#     plt.tight_layout()
+#     plt.savefig(out_path, dpi=120)
+#     plt.close()
 
 def plot_postmet_scatter(
     y_post_from_gt: np.ndarray,
